@@ -692,6 +692,7 @@ class DisparoMassaReq(BaseModel):
     setor_destino: str
     status_filtro: str = "NOVO"
     enviar_ambos_numeros: bool = False
+    lead_ids: List[int] = []
 
 
 class ExcluirMassaLeadsReq(BaseModel):
@@ -1233,7 +1234,15 @@ async def iniciar_disparo_massa(dados: DisparoMassaReq, request: Request, backgr
             if not tpl:
                 raise HTTPException(status_code=404, detail="Template de mensagem não encontrado.")
 
-            if status_filtro == "TODOS":
+            if status_filtro == "SELECIONADOS":
+                if not dados.lead_ids:
+                    raise HTTPException(status_code=400, detail="Marque pelo menos um lead no grid antes de disparar.")
+                placeholders = ", ".join(["%s"] * len(dados.lead_ids))
+                cur.execute(
+                    f"SELECT * FROM leads_crm WHERE id IN ({placeholders}) ORDER BY id ASC",
+                    tuple(dados.lead_ids),
+                )
+            elif status_filtro == "TODOS":
                 cur.execute("SELECT * FROM leads_crm ORDER BY id ASC")
             else:
                 cur.execute("SELECT * FROM leads_crm WHERE status_lead = %s ORDER BY id ASC", (status_filtro,))
@@ -1242,7 +1251,7 @@ async def iniciar_disparo_massa(dados: DisparoMassaReq, request: Request, backgr
         conn.close()
 
     if not leads:
-        raise HTTPException(status_code=400, detail=f"Nenhum lead encontrado com o status '{status_filtro}'.")
+        raise HTTPException(status_code=400, detail=f"Nenhum lead encontrado para o filtro '{status_filtro}'.")
 
     total_destinos = sum(len(extrair_jids_lead(l, dados.enviar_ambos_numeros)) for l in leads)
 
@@ -1822,8 +1831,9 @@ HTML_PAINEL = """
                   <select id="selectSetorDisparo" class="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs bg-white"></select>
                 </div>
                 <div>
-                  <label class="block text-[11px] font-semibold text-slate-600 mb-1">Status dos Leads para Envio</label>
+                  <label class="block text-[11px] font-semibold text-slate-600 mb-1">Público / Status dos Leads para Envio</label>
                   <select id="selectStatusDisparo" class="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs bg-white font-medium text-slate-700">
+                    <option value="SELECIONADOS" id="optStatusSelecionados">SELECIONADOS (0 marcados no grid)</option>
                     <option value="NOVO" selected>NOVO (Apenas não contatados)</option>
                     <option value="CONTATADO">CONTATADO (Reengajamento / Follow-up)</option>
                     <option value="EM_ATENDIMENTO">EM_ATENDIMENTO</option>
@@ -2410,8 +2420,12 @@ HTML_PAINEL = """
       const btnMassa = document.getElementById("btnExcluirMassaLeads");
       const spanQtd = document.getElementById("qtdLeadsSelecionados");
       const chkTodos = document.getElementById("chkSelecionarTodosLeads");
+      const optSel = document.getElementById("optStatusSelecionados");
 
       spanQtd.innerText = LEADS_SELECIONADOS.size;
+      if (optSel) {
+        optSel.innerText = `SELECIONADOS (${LEADS_SELECIONADOS.size} marcados no grid)`;
+      }
       if (LEADS_SELECIONADOS.size > 0) {
         btnMassa.classList.remove("hidden");
       } else {
@@ -2604,13 +2618,22 @@ HTML_PAINEL = """
       const setor_destino = document.getElementById("selectSetorDisparo").value;
       const status_filtro = document.getElementById("selectStatusDisparo").value;
       const enviar_ambos_numeros = document.getElementById("chkEnviarAmbosNumeros").checked;
+      const lead_ids = Array.from(LEADS_SELECIONADOS);
+
       if (!template_id) return alert("Cadastre ou selecione uma mensagem primeiro.");
+      if (status_filtro === "SELECIONADOS" && lead_ids.length === 0) {
+        return alert("Marque pelo menos um lead na tabela abaixo antes de iniciar o envio.");
+      }
+
+      const alvoDesc = status_filtro === "SELECIONADOS"
+        ? `os ${lead_ids.length} lead(s) marcado(s) no grid`
+        : `leads com status '${status_filtro}'`;
       const extraMsg = enviar_ambos_numeros ? " (incluindo Telefone quando diferente do Celular)" : "";
-      if (!confirm(`Deseja iniciar o envio em massa para leads com status '${status_filtro}'${extraMsg} respeitando as regras Anti-Banimento?`)) return;
+      if (!confirm(`Deseja iniciar o envio em massa para ${alvoDesc}${extraMsg} respeitando as regras Anti-Banimento?`)) return;
 
       const res = await fetch("/api/admin/disparo-massa", {
         method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ template_id, setor_destino, status_filtro, enviar_ambos_numeros })
+        body: JSON.stringify({ template_id, setor_destino, status_filtro, enviar_ambos_numeros, lead_ids })
       });
       if (res.ok) {
         verificarProgressoCampanha();
