@@ -1,8 +1,8 @@
 fastapi
 uvicorn
 httpx
-pymysql
-cryptography
-python-multipart
-imageio-ffmpeg
+psycopg2-binary
 openpyxl
+imageio-ffmpeg
+python-multipart
+pydantic
