@@ -3,3 +3,4 @@ uvicorn
 httpx
 pymysql
 cryptography
+python-multipart
