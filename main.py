@@ -387,8 +387,7 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
                 conn.close()
 
             resp_msg = (
-                f"✅ Você foi direcionado para *{nome_setor}*.
-"
+                f"✅ Você foi direcionado para *{nome_setor}*.\n"
                 "Pode enviar sua mensagem, áudio ou anexo que nossa equipe já vai lhe atender."
             )
             await enviar_texto_wa(jid, resp_msg)
@@ -404,14 +403,10 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
             finally:
                 conn.close()
 
-            linhas_opcoes = "
-".join([f"*{p['opcao_menu']}* - {p['nome']}" for p in perfis])
+            linhas_opcoes = "\n".join([f"*{p['opcao_menu']}* - {p['nome']}" for p in perfis])
             menu = (
-                f"Olá, *{push_name}*! Bem-vindo à *Tottem Tecnologia*.
-
-"
-                f"Responda apenas com o número do departamento desejado:
-{linhas_opcoes}"
+                f"Olá, *{push_name}*! Bem-vindo à *Tottem Tecnologia*.\n\n"
+                f"Responda apenas com o número do departamento desejado:\n{linhas_opcoes}"
             )
             await enviar_texto_wa(jid, menu)
             registrar_mensagem(jid, "BOT", menu)
