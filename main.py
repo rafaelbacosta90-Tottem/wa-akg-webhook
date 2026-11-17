@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import logging
 import subprocess
+import py_compile
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
@@ -20,7 +21,7 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("tottem-atendimento")
 
-app = FastAPI(title="Tottem Atendimento Pro — Multi-Departamento")
+app = FastAPI(title="Tottem OmniDesk — Atendimento Corporativo")
 
 # ==============================================================================
 # VARIÁVEIS DE AMBIENTE (RENDER)
@@ -36,30 +37,29 @@ ADMIN_SENHA = os.getenv("ADMIN_SENHA", "tottem2026")
 HEADERS_WA = {"X-API-Key": API_KEY}
 HEADERS_WA_JSON = {"Content-Type": "application/json", "X-API-Key": API_KEY}
 
-# Diretório local para cache/armazenamento de mídias recebidas e enviadas
 MEDIA_DIR = Path("media_files")
 MEDIA_DIR.mkdir(exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 
 # ==============================================================================
-# UTILITÁRIOS DE SEGURANÇA E CONVERSÃO DE ÁUDIO
+# SEGURANÇA E CONVERSÃO DE ÁUDIO OGG/OPUS (NATIVO WHATSAPP)
 # ==============================================================================
 def hash_senha(senha: str) -> str:
     return hashlib.sha256(senha.encode("utf-8")).hexdigest()
 
 
-def converter_para_mp3(origem: Path) -> Path:
-    """Converte áudio WebM/OGG do navegador para MP3 compatível com WhatsApp iOS/Android."""
-    destino_mp3 = origem.with_suffix(".mp3")
+def converter_para_ogg(origem: Path) -> Path:
+    """Converte áudio do navegador para OGG/Opus nativo do WhatsApp (Android/iOS)."""
+    destino_ogg = origem.with_suffix(".ogg")
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg_exe, "-y", "-i", str(origem),
-        "-vn", "-ar", "44100", "-ac", "1", "-b:a", "64k",
-        str(destino_mp3)
+        "-vn", "-c:a", "libopus", "-ar", "16000", "-ac", "1", "-b:a", "24k",
+        str(destino_ogg)
     ]
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    return destino_mp3
+    return destino_ogg
 
 
 # ==============================================================================
@@ -90,7 +90,6 @@ def init_db():
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # 1. Tabela de Perfis / Departamentos
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS perfis_atendimento (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -102,7 +101,6 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
 
-            # 2. Tabela de Usuários e Vínculo com Perfil
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS usuarios_painel (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -119,7 +117,6 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
 
-            # 3. Tabela de Atendimentos (Tickets)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS atendimentos (
                     jid VARCHAR(100) PRIMARY KEY,
@@ -127,12 +124,12 @@ def init_db():
                     setor VARCHAR(30) DEFAULT 'TRIAGEM',
                     status VARCHAR(30) DEFAULT 'TRIAGEM',
                     ultima_mensagem TEXT,
+                    notas_crm TEXT,
                     nao_lidas INT DEFAULT 0,
                     atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
 
-            # 4. Tabela de Mensagens (com suporte a mídia)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS mensagens_atendimento (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -146,17 +143,16 @@ def init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
             """)
 
-            # Migração segura caso as colunas novas ainda não existam
-            try:
-                cur.execute("ALTER TABLE mensagens_atendimento ADD COLUMN tipo_midia VARCHAR(20) DEFAULT 'TEXT'")
-            except Exception:
-                pass
-            try:
-                cur.execute("ALTER TABLE mensagens_atendimento ADD COLUMN url_midia VARCHAR(255) NULL")
-            except Exception:
-                pass
+            for alter in [
+                "ALTER TABLE mensagens_atendimento ADD COLUMN tipo_midia VARCHAR(20) DEFAULT 'TEXT'",
+                "ALTER TABLE mensagens_atendimento ADD COLUMN url_midia VARCHAR(255) NULL",
+                "ALTER TABLE atendimentos ADD COLUMN notas_crm TEXT",
+            ]:
+                try:
+                    cur.execute(alter)
+                except Exception:
+                    pass
 
-            # Perfis padrão iniciais (Suporte e Comercial)
             cur.execute("""
                 INSERT IGNORE INTO perfis_atendimento (codigo, nome, opcao_menu, descricao)
                 VALUES
@@ -164,7 +160,6 @@ def init_db():
                     ('COMERCIAL', 'Comercial e Orçamentos', '2', 'Vendas, propostas e licitações')
             """)
 
-            # Usuário Administrador inicial
             cur.execute("SELECT id FROM usuarios_painel WHERE email = %s", (ADMIN_EMAIL,))
             if not cur.fetchone():
                 cur.execute(
@@ -174,7 +169,7 @@ def init_db():
                     """,
                     ("Administrador", ADMIN_EMAIL, hash_senha(ADMIN_SENHA)),
                 )
-        logger.info("Banco de dados sincronizado com sucesso.")
+        logger.info("Banco de dados sincronizado.")
     finally:
         conn.close()
 
@@ -186,7 +181,7 @@ def on_startup():
 
 
 # ==============================================================================
-# INTEGRAÇÃO WA-AKG (TEXTO, DOWNLOAD DE MÍDIA E ENVIO DE MÍDIA)
+# INTEGRAÇÃO WA-AKG
 # ==============================================================================
 async def enviar_texto_wa(jid: str, texto: str) -> bool:
     url = f"{WA_BASE_URL}/messages/{SESSION_ID}/{jid}/send"
@@ -203,8 +198,8 @@ async def enviar_texto_wa(jid: str, texto: str) -> bool:
 async def enviar_midia_wa(jid: str, file_path: Path, filename: str, media_type: str, caption: str = "") -> bool:
     url = f"{WA_BASE_URL}/messages/{SESSION_ID}/{jid}/media"
     mime_map = {
-        "audio": "audio/mpeg",
-        "voice": "audio/mpeg",
+        "audio": "audio/ogg; codecs=opus",
+        "voice": "audio/ogg; codecs=opus",
         "image": "image/jpeg",
         "video": "video/mp4",
         "document": "application/pdf",
@@ -215,7 +210,7 @@ async def enviar_midia_wa(jid: str, file_path: Path, filename: str, media_type: 
         try:
             with open(file_path, "rb") as f:
                 files = {"file": (filename, f, mime)}
-                tipo_api = "audio" if media_type in {"audio", "voice"} else media_type
+                tipo_api = "voice" if media_type in {"audio", "voice"} else media_type
                 data = {"type": tipo_api, "caption": caption}
                 resp = await client.post(url, headers=HEADERS_WA, files=files, data=data)
                 logger.info(f"Envio Mídia WA ({tipo_api}) -> {jid} | Status: {resp.status_code} | Resp: {resp.text}")
@@ -226,7 +221,6 @@ async def enviar_midia_wa(jid: str, file_path: Path, filename: str, media_type: 
 
 
 async def baixar_midia_wa(data: Dict[str, Any], key: Dict[str, Any], tipo: str) -> Optional[str]:
-    """Baixa mídia usando fileUrl direto do payload ou a rota /download/{messageId}/media."""
     ext_map = {
         "IMAGE": ".jpg",
         "AUDIO": ".ogg",
@@ -237,7 +231,6 @@ async def baixar_midia_wa(data: Dict[str, Any], key: Dict[str, Any], tipo: str) 
     }
     ext = ext_map.get(tipo.upper(), ".bin")
     file_url = data.get("fileUrl")
-
     urls_tentativa: List[str] = []
 
     if file_url:
@@ -255,15 +248,13 @@ async def baixar_midia_wa(data: Dict[str, Any], key: Dict[str, Any], tipo: str) 
         for url in urls_tentativa:
             try:
                 resp = await client.get(url, headers=HEADERS_WA, follow_redirects=True)
-                logger.info(f"Tentativa download mídia ({url}) -> Status: {resp.status_code} | Bytes: {len(resp.content)}")
                 if resp.status_code == 200 and len(resp.content) > 100:
                     nome_arquivo = f"in_{uuid.uuid4().hex}{ext}"
                     destino = MEDIA_DIR / nome_arquivo
                     destino.write_bytes(resp.content)
                     return f"/media/{nome_arquivo}"
             except Exception as e:
-                logger.error(f"Erro ao baixar mídia de {url}: {e}")
-
+                logger.error(f"Erro download mídia {url}: {e}")
     return None
 
 
@@ -302,7 +293,7 @@ def registrar_mensagem(
 
 
 # ==============================================================================
-# WEBHOOK DE RECEBIMENTO (TEXTO, ÁUDIO E ANEXOS + MENU DINÂMICO)
+# WEBHOOK DE RECEBIMENTO
 # ==============================================================================
 async def processar_webhook(payload: Dict[str, Any]) -> None:
     try:
@@ -339,7 +330,7 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
         if msg_type in {"IMAGE", "AUDIO", "VOICE", "VIDEO", "DOCUMENT", "STICKER"} or data.get("fileUrl"):
             url_midia = await baixar_midia_wa(data, key, msg_type)
             if not texto:
-                texto = f"Arquivo recebido ({msg_type})"
+                texto = f"Mídia recebida ({msg_type})"
         else:
             msg_type = "TEXT"
 
@@ -415,7 +406,7 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
 
 
 # ==============================================================================
-# AUTENTICAÇÃO E MIDDLEWARE DE USUÁRIO
+# MODELOS E ROTAS DA API
 # ==============================================================================
 class LoginReq(BaseModel):
     email: str
@@ -445,6 +436,7 @@ class EnvioTextoReq(BaseModel):
 class AcaoTicketReq(BaseModel):
     jid: str
     novo_setor: Optional[str] = None
+    notas_crm: Optional[str] = None
 
 
 def obter_usuario_atual(request: Request) -> Dict[str, Any]:
@@ -464,7 +456,7 @@ def obter_usuario_atual(request: Request) -> Dict[str, Any]:
             """, (token,))
             user = cur.fetchone()
             if not user:
-                raise HTTPException(status_code=401, detail="Sessão expirada ou inválida")
+                raise HTTPException(status_code=401, detail="Sessão inválida")
             return user
     finally:
         conn.close()
@@ -488,7 +480,7 @@ def login(dados: LoginReq):
             """, (dados.email.strip().lower(), hash_senha(dados.senha)))
             user = cur.fetchone()
             if not user:
-                raise HTTPException(status_code=401, detail="E-mail ou senha incorretos")
+                raise HTTPException(status_code=401, detail="Credenciais inválidas")
 
             token = secrets.token_hex(32)
             cur.execute("UPDATE usuarios_painel SET token_sessao = %s WHERE id = %s", (token, user["id"]))
@@ -509,9 +501,6 @@ def login(dados: LoginReq):
         conn.close()
 
 
-# ==============================================================================
-# ROTAS ADMINISTRATIVAS: PERFIS E USUÁRIOS
-# ==============================================================================
 @app.get("/api/admin/perfis")
 def listar_perfis(request: Request):
     obter_usuario_atual(request)
@@ -540,7 +529,7 @@ def criar_perfil(dados: PerfilReq, request: Request):
             )
         return {"status": "criado"}
     except pymysql.err.IntegrityError:
-        raise HTTPException(status_code=400, detail="Código de perfil já existe.")
+        raise HTTPException(status_code=400, detail="Código já existe.")
     finally:
         conn.close()
 
@@ -582,8 +571,7 @@ def criar_usuario(dados: UsuarioReq, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     if not dados.senha:
-        raise HTTPException(status_code=400, detail="Senha obrigatória para novo usuário")
-
+        raise HTTPException(status_code=400, detail="Senha obrigatória")
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -608,24 +596,14 @@ def vincular_usuario_perfil(usuario_id: int, dados: UsuarioReq, request: Request
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            if dados.senha:
-                cur.execute(
-                    """
-                    UPDATE usuarios_painel
-                    SET nome = %s, email = %s, role = %s, perfil_id = %s, senha_hash = %s
-                    WHERE id = %s
-                    """,
-                    (dados.nome.strip(), dados.email.strip().lower(), dados.role, dados.perfil_id, hash_senha(dados.senha), usuario_id),
-                )
-            else:
-                cur.execute(
-                    """
-                    UPDATE usuarios_painel
-                    SET nome = %s, email = %s, role = %s, perfil_id = %s
-                    WHERE id = %s
-                    """,
-                    (dados.nome.strip(), dados.email.strip().lower(), dados.role, dados.perfil_id, usuario_id),
-                )
+            cur.execute(
+                """
+                UPDATE usuarios_painel
+                SET nome = %s, email = %s, role = %s, perfil_id = %s
+                WHERE id = %s
+                """,
+                (dados.nome.strip(), dados.email.strip().lower(), dados.role, dados.perfil_id, usuario_id),
+            )
         return {"status": "atualizado"}
     finally:
         conn.close()
@@ -636,7 +614,7 @@ def excluir_usuario(usuario_id: int, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     if user["id"] == usuario_id:
-        raise HTTPException(status_code=400, detail="Você não pode excluir seu próprio usuário.")
+        raise HTTPException(status_code=400, detail="Não é possível excluir seu próprio usuário.")
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -646,12 +624,9 @@ def excluir_usuario(usuario_id: int, request: Request):
         conn.close()
 
 
-# ==============================================================================
-# ROTAS DE ATENDIMENTO (FILA ISOLADA POR PERFIL, TEXTO, ÁUDIO E ANEXOS)
-# ==============================================================================
 @app.get("/")
 async def health_check():
-    return {"status": "online", "service": "tottem-atendimento-pro"}
+    return {"status": "online", "service": "tottem-omnidesk"}
 
 
 @app.post("/webhook/whatsapp")
@@ -673,17 +648,17 @@ def listar_chats(request: Request, filtro_setor: Optional[str] = None):
             if user["role"] == "ADMIN":
                 if filtro_setor and filtro_setor != "TODOS":
                     cur.execute(
-                        "SELECT * FROM atendimentos WHERE setor = %s AND status = 'EM_ATENDIMENTO' ORDER BY atualizado_em DESC",
+                        "SELECT *, DATE_FORMAT(atualizado_em, '%%H:%%i') as hora_fmt FROM atendimentos WHERE setor = %s AND status = 'EM_ATENDIMENTO' ORDER BY atualizado_em DESC",
                         (filtro_setor,),
                     )
                 else:
-                    cur.execute("SELECT * FROM atendimentos ORDER BY atualizado_em DESC LIMIT 100")
+                    cur.execute("SELECT *, DATE_FORMAT(atualizado_em, '%%H:%%i') as hora_fmt FROM atendimentos ORDER BY atualizado_em DESC LIMIT 100")
             else:
                 setor_user = user["perfil_codigo"]
                 if not setor_user:
                     return []
                 cur.execute(
-                    "SELECT * FROM atendimentos WHERE setor = %s AND status = 'EM_ATENDIMENTO' ORDER BY atualizado_em DESC",
+                    "SELECT *, DATE_FORMAT(atualizado_em, '%%H:%%i') as hora_fmt FROM atendimentos WHERE setor = %s AND status = 'EM_ATENDIMENTO' ORDER BY atualizado_em DESC",
                     (setor_user,),
                 )
             return cur.fetchall()
@@ -712,6 +687,18 @@ def listar_mensagens(jid: str, request: Request):
         conn.close()
 
 
+@app.post("/api/painel/notas")
+def salvar_notas_crm(dados: AcaoTicketReq, request: Request):
+    obter_usuario_atual(request)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE atendimentos SET notas_crm = %s WHERE jid = %s", (dados.notas_crm or "", dados.jid))
+        return {"status": "salvo"}
+    finally:
+        conn.close()
+
+
 @app.post("/api/painel/enviar")
 async def responder_texto(dados: EnvioTextoReq, request: Request):
     user = obter_usuario_atual(request)
@@ -719,7 +706,7 @@ async def responder_texto(dados: EnvioTextoReq, request: Request):
     if not sucesso:
         raise HTTPException(status_code=500, detail="Falha ao enviar mensagem pelo WA-AKG")
 
-    assinatura = f"{user['nome']} ({user['perfil_codigo'] or 'ADMIN'})"
+    assinatura = f"{user['nome']} • {user['perfil_codigo'] or 'ADMIN'}"
     registrar_mensagem(dados.jid, assinatura, dados.texto, tipo_midia="TEXT")
     return {"status": "enviado"}
 
@@ -740,20 +727,20 @@ async def responder_midia(
     conteudo_bytes = await arquivo.read()
     caminho_salvo.write_bytes(conteudo_bytes)
 
-    if tipo in {"voice", "audio"} and ext.lower() not in {".mp3"}:
+    if tipo in {"voice", "audio"} and ext.lower() not in {".ogg"}:
         try:
-            caminho_mp3 = converter_para_mp3(caminho_salvo)
-            caminho_salvo = caminho_mp3
-            nome_salvo = caminho_mp3.name
+            caminho_ogg = converter_para_ogg(caminho_salvo)
+            caminho_salvo = caminho_ogg
+            nome_salvo = caminho_ogg.name
         except Exception as e:
-            logger.error(f"Erro na conversão FFmpeg para MP3: {e}")
+            logger.error(f"Erro na conversão FFmpeg para OGG: {e}")
 
     sucesso = await enviar_midia_wa(jid, caminho_salvo, nome_salvo, tipo, legenda)
     if not sucesso:
         raise HTTPException(status_code=500, detail="Falha ao enviar mídia pelo WA-AKG")
 
-    assinatura = f"{user['nome']} ({user['perfil_codigo'] or 'ADMIN'})"
-    texto_registro = legenda if legenda else f"Arquivo enviado: {nome_salvo}"
+    assinatura = f"{user['nome']} • {user['perfil_codigo'] or 'ADMIN'}"
+    texto_registro = legenda if legenda else f"Anexo enviado ({nome_salvo})"
     registrar_mensagem(
         jid,
         assinatura,
@@ -806,7 +793,7 @@ async def encerrar_atendimento(dados: AcaoTicketReq, request: Request):
 
 
 # ==============================================================================
-# INTERFACE WEB COMPLETA (/painel) — ATENDIMENTO + PERFIS + USUÁRIOS
+# INTERFACE ENTERPRISE OMNICHANNEL (/painel)
 # ==============================================================================
 HTML_PAINEL = """
 <!DOCTYPE html>
@@ -814,173 +801,300 @@ HTML_PAINEL = """
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tottem Atendimento Pro</title>
+  <title>Tottem OmniDesk — Central de Atendimento</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', sans-serif; }
+    .chat-bg {
+      background-color: #efeae2;
+      background-image: radial-gradient(#d4cdc3 0.75px, transparent 0.75px);
+      background-size: 16px 16px;
+    }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 9999px; }
+  </style>
 </head>
-<body class="bg-slate-100 h-screen flex flex-col font-sans">
+<body class="bg-slate-950 h-screen flex overflow-hidden select-none">
 
-  <!-- MODAL DE LOGIN -->
-  <div id="loginModal" class="fixed inset-0 bg-slate-900/90 flex items-center justify-center z-50">
-    <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md space-y-5">
-      <div>
-        <h1 class="text-2xl font-bold text-slate-800">Tottem Atendimento</h1>
-        <p class="text-sm text-slate-500">Entre com seu usuário e senha corporativos.</p>
+  <!-- TELA DE LOGIN CORPORATIVA -->
+  <div id="loginModal" class="fixed inset-0 bg-slate-950 flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-4xl grid grid-cols-1 md:grid-cols-2 overflow-hidden">
+      <div class="bg-gradient-to-br from-slate-900 via-slate-800 to-emerald-950 text-white p-10 flex flex-col justify-between">
+        <div>
+          <div class="inline-flex items-center gap-2 bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 text-xs font-semibold px-3 py-1 rounded-full mb-6">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span> Tottem OmniDesk v2.0
+          </div>
+          <h1 class="text-3xl font-bold tracking-tight leading-tight">Central Inteligente de Atendimento</h1>
+          <p class="text-slate-300 text-sm mt-4 leading-relaxed">
+            Gestão unificada de WhatsApp por departamentos, roteamento automático, áudio nativo e controle de equipe em tempo real.
+          </p>
+        </div>
+        <div class="text-xs text-slate-400 border-t border-slate-700/80 pt-4">
+          Tottem Tecnologia • Plataforma Corporativa
+        </div>
       </div>
-      <div>
-        <label class="block text-sm font-medium text-slate-700 mb-1">E-mail</label>
-        <input id="loginEmail" type="email" placeholder="seu@email.com" class="w-full border border-slate-300 rounded-lg p-2.5" />
+
+      <div class="p-10 flex flex-col justify-center space-y-5">
+        <div>
+          <h2 class="text-xl font-bold text-slate-900">Acesso ao Painel</h2>
+          <p class="text-xs text-slate-500 mt-1">Insira suas credenciais de operador ou supervisor.</p>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1.5">E-mail Corporativo</label>
+          <input id="loginEmail" type="email" placeholder="operador@tottemtecnologia.com.br"
+                 class="w-full border border-slate-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500" />
+        </div>
+        <div>
+          <label class="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1.5">Senha</label>
+          <input id="loginSenha" type="password" placeholder="••••••••"
+                 onkeydown="if(event.key==='Enter') fazerLogin()"
+                 class="w-full border border-slate-300 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500" />
+        </div>
+        <div id="loginErro" class="hidden bg-rose-50 border border-rose-200 text-rose-700 text-xs px-3 py-2.5 rounded-lg">
+          E-mail ou senha inválidos. Verifique e tente novamente.
+        </div>
+        <button onclick="fazerLogin()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 rounded-xl shadow-lg shadow-emerald-600/20 transition text-sm">
+          Entrar na Plataforma
+        </button>
       </div>
-      <div>
-        <label class="block text-sm font-medium text-slate-700 mb-1">Senha</label>
-        <input id="loginSenha" type="password" placeholder="••••••••" class="w-full border border-slate-300 rounded-lg p-2.5" />
+    </div>
+  </div>
+
+  <!-- BARRA LATERAL DE NAVEGAÇÃO (RAIL) -->
+  <nav class="w-16 bg-slate-900 border-r border-slate-800 flex flex-col items-center py-4 justify-between z-20">
+    <div class="flex flex-col items-center gap-4">
+      <div class="w-10 h-10 rounded-xl bg-emerald-600 text-white font-bold flex items-center justify-center shadow-lg shadow-emerald-600/30 text-lg">
+        T
       </div>
-      <p id="loginErro" class="text-red-600 text-sm hidden">E-mail ou senha inválidos.</p>
-      <button onclick="fazerLogin()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-2.5 rounded-lg transition">
-        Entrar no Sistema
+      <div class="h-px w-8 bg-slate-800 my-1"></div>
+
+      <button onclick="mudarAba('atendimento')" id="railAtendimento" title="Central de Atendimento"
+              class="w-11 h-11 rounded-xl flex items-center justify-center text-white bg-slate-800 transition">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
+      </button>
+
+      <button onclick="mudarAba('perfis')" id="railPerfis" title="Perfis e Departamentos"
+              class="hidden w-11 h-11 rounded-xl flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 transition">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+      </button>
+
+      <button onclick="mudarAba('usuarios')" id="railUsuarios" title="Equipe e Vínculos"
+              class="hidden w-11 h-11 rounded-xl flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 transition">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
       </button>
     </div>
-  </div>
 
-  <!-- CABEÇALHO SUPERIOR -->
-  <header class="bg-slate-900 text-white px-6 py-3 flex items-center justify-between shadow">
-    <div class="flex items-center gap-4">
-      <span class="font-bold text-lg tracking-tight">Tottem Atendimento</span>
-      <span id="badgeUsuario" class="bg-emerald-600 text-xs font-semibold px-3 py-1 rounded-full"></span>
-      <nav class="flex gap-2 ml-4">
-        <button onclick="mudarAba('atendimento')" id="tabBtnAtendimento" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-700">💬 Atendimento</button>
-        <button onclick="mudarAba('perfis')" id="tabBtnPerfis" class="hidden px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-slate-800">🏷️ Perfis / Setores</button>
-        <button onclick="mudarAba('usuarios')" id="tabBtnUsuarios" class="hidden px-3 py-1.5 rounded-lg text-xs font-semibold hover:bg-slate-800">👥 Usuários e Vínculos</button>
-      </nav>
+    <div class="flex flex-col items-center gap-3">
+      <div class="relative" title="Online">
+        <div id="avatarOperador" class="w-9 h-9 rounded-full bg-slate-700 text-xs font-bold text-white flex items-center justify-center">OP</div>
+        <span class="absolute bottom-0 right-0 w-2.5 h-2.5 bg-emerald-500 border-2 border-slate-900 rounded-full"></span>
+      </div>
+      <button onclick="sair()" title="Encerrar Sessão" class="w-10 h-10 rounded-xl flex items-center justify-center text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+      </button>
     </div>
-    <button onclick="sair()" class="text-xs bg-rose-600 hover:bg-rose-700 px-3 py-1.5 rounded-lg font-medium">Sair</button>
-  </header>
+  </nav>
 
-  <!-- ABA 1: ATENDIMENTO -->
-  <div id="abaAtendimento" class="flex flex-1 overflow-hidden">
-    <aside class="w-80 bg-white border-r border-slate-200 flex flex-col">
-      <div class="p-3 border-b border-slate-200 space-y-2">
-        <div class="flex justify-between items-center">
-          <span class="font-semibold text-slate-700 text-sm">Fila de Atendimento</span>
-          <span id="contadorChats" class="text-xs bg-slate-200 text-slate-700 px-2 py-0.5 rounded-full">0</span>
-        </div>
-        <select id="filtroAdminSetor" onchange="atualizarFila()" class="hidden w-full text-xs border border-slate-300 rounded p-1.5 bg-slate-50">
-          <option value="TODOS">Todos os Departamentos</option>
-        </select>
+  <!-- ÁREA PRINCIPAL -->
+  <div class="flex-1 flex flex-col bg-slate-50 overflow-hidden">
+
+    <!-- TOPBAR -->
+    <header class="h-14 bg-white border-b border-slate-200 px-6 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <span id="tituloPagina" class="font-bold text-slate-800 text-base">Atendimentos</span>
+        <span id="badgeSetorAtual" class="bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold px-2.5 py-0.5 rounded-full"></span>
       </div>
-      <div id="listaChats" class="flex-1 overflow-y-auto divide-y divide-slate-100"></div>
-    </aside>
-
-    <main class="flex-1 flex flex-col bg-[#efeae2]">
-      <div id="chatVazio" class="flex-1 flex items-center justify-center text-slate-500">
-        Selecione um atendimento na fila à esquerda.
+      <div class="flex items-center gap-4 text-xs text-slate-500">
+        <span class="inline-flex items-center gap-1.5">
+          <span class="w-2 h-2 rounded-full bg-emerald-500"></span> WhatsApp Conectado
+        </span>
+        <span id="nomeOperadorTop" class="font-semibold text-slate-700"></span>
       </div>
+    </header>
 
-      <div id="chatAtivo" class="hidden flex-1 flex flex-col h-full">
-        <div class="bg-white px-6 py-3 border-b border-slate-200 flex items-center justify-between">
-          <div>
-            <h2 id="contatoNome" class="font-bold text-slate-800"></h2>
-            <p id="contatoNumero" class="text-xs text-slate-500"></p>
+    <!-- ABA 1: WORKSPACE DE ATENDIMENTO (3 PAINÉIS) -->
+    <div id="abaAtendimento" class="flex-1 flex overflow-hidden">
+
+      <!-- COLUNA ESQUERDA: LISTA DE CONVERSAS -->
+      <aside class="w-80 bg-white border-r border-slate-200 flex flex-col">
+        <div class="p-3 border-b border-slate-100 space-y-2.5">
+          <div class="relative">
+            <input id="buscaContato" oninput="renderizarListaChats()" type="text" placeholder="Buscar cliente ou número..."
+                   class="w-full bg-slate-100 text-xs rounded-lg pl-8 pr-3 py-2 focus:outline-none focus:bg-white focus:ring-1 focus:ring-emerald-500" />
+            <svg class="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
           </div>
-          <div class="flex gap-2 items-center">
-            <select id="selectTransferir" class="text-xs border border-slate-300 rounded-lg px-2 py-1.5 bg-white"></select>
-            <button onclick="transferir()" class="text-xs bg-amber-500 hover:bg-amber-600 text-white font-medium px-3 py-1.5 rounded-lg">
-              Transferir
-            </button>
-            <button onclick="encerrar()" class="text-xs bg-rose-600 hover:bg-rose-700 text-white font-medium px-3 py-1.5 rounded-lg">
-              Encerrar
-            </button>
+          <div class="flex items-center justify-between gap-2">
+            <select id="filtroAdminSetor" onchange="atualizarFila()" class="hidden flex-1 text-xs border border-slate-200 rounded-lg px-2 py-1.5 bg-slate-50 text-slate-700 font-medium">
+              <option value="TODOS">Todos os Departamentos</option>
+            </select>
+            <span class="text-[11px] font-semibold text-slate-500 whitespace-nowrap">Fila: <strong id="contadorChats" class="text-slate-800">0</strong></span>
           </div>
         </div>
+        <div id="listaChats" class="flex-1 overflow-y-auto divide-y divide-slate-100"></div>
+      </aside>
 
-        <div id="areaMensagens" class="flex-1 overflow-y-auto p-6 space-y-3"></div>
+      <!-- COLUNA CENTRAL: JANELA DE CONVERSA -->
+      <main class="flex-1 flex flex-col chat-bg relative">
+        <div id="chatVazio" class="flex-1 flex flex-col items-center justify-center text-slate-400 bg-slate-50/90">
+          <div class="w-16 h-16 rounded-2xl bg-slate-200/70 flex items-center justify-center mb-3">
+            <svg class="w-8 h-8 text-slate-400" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
+          </div>
+          <p class="text-sm font-medium text-slate-600">Nenhuma conversa selecionada</p>
+          <p class="text-xs text-slate-400 mt-1">Escolha um cliente na fila à esquerda para iniciar o atendimento.</p>
+        </div>
 
-        <!-- Barra de Envio: Anexo, Gravação de Áudio e Texto -->
-        <div class="bg-white p-3 border-t border-slate-200 flex items-center gap-2">
-          <input type="file" id="inputArquivo" class="hidden" onchange="enviarAnexoSelecionado()" />
-          <button type="button" onclick="document.getElementById('inputArquivo').click()" title="Enviar Imagem, Documento ou Áudio"
-                  class="p-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold">
-            📎
-          </button>
-          <button type="button" id="btnGravarAudio" onclick="alternarGravacaoAudio()" title="Gravar Áudio pelo Microfone"
-                  class="p-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold">
-            🎤
-          </button>
-          <form onsubmit="enviarTexto(event)" class="flex-1 flex gap-2">
-            <input id="inputMensagem" type="text" placeholder="Digite sua mensagem..." autocomplete="off"
-                   class="flex-1 border border-slate-300 rounded-xl px-4 py-2.5 focus:outline-none focus:border-emerald-500" />
-            <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-6 py-2.5 rounded-xl">
-              Enviar
+        <div id="chatAtivo" class="hidden flex-1 flex flex-col h-full">
+          <!-- Header do Chat -->
+          <div class="h-14 bg-white px-5 border-b border-slate-200 flex items-center justify-between shadow-sm z-10">
+            <div class="flex items-center gap-3">
+              <div id="avatarClienteChat" class="w-9 h-9 rounded-full bg-emerald-600 text-white font-bold text-xs flex items-center justify-center">CL</div>
+              <div>
+                <h2 id="contatoNome" class="font-bold text-slate-800 text-sm leading-tight"></h2>
+                <p id="contatoNumero" class="text-[11px] text-slate-500"></p>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <span id="badgeSetorChat" class="text-[11px] font-bold px-2.5 py-1 rounded-md bg-slate-100 text-slate-700 border border-slate-200"></span>
+            </div>
+          </div>
+
+          <!-- Mensagens -->
+          <div id="areaMensagens" class="flex-1 overflow-y-auto px-6 py-4 space-y-3"></div>
+
+          <!-- Barra de Composição -->
+          <div class="bg-white px-4 py-3 border-t border-slate-200 flex items-center gap-2.5">
+            <input type="file" id="inputArquivo" class="hidden" onchange="enviarAnexoSelecionado()" />
+            <button type="button" onclick="document.getElementById('inputArquivo').click()" title="Anexar Arquivo, Imagem ou Documento"
+                    class="w-10 h-10 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center transition">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/></svg>
             </button>
-          </form>
+
+            <button type="button" id="btnGravarAudio" onclick="alternarGravacaoAudio()" title="Gravar Mensagem de Voz"
+                    class="w-10 h-10 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center transition">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/></svg>
+            </button>
+
+            <span id="statusGravacao" class="hidden text-xs font-semibold text-rose-600 animate-pulse">Gravando áudio...</span>
+
+            <form onsubmit="enviarTexto(event)" class="flex-1 flex gap-2">
+              <input id="inputMensagem" type="text" placeholder="Escreva uma mensagem para o cliente..." autocomplete="off"
+                     class="flex-1 bg-slate-100 border border-transparent focus:bg-white focus:border-emerald-500 rounded-xl px-4 py-2.5 text-sm focus:outline-none transition" />
+              <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-5 py-2.5 rounded-xl text-sm shadow-sm transition flex items-center gap-1.5">
+                <span>Enviar</span>
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
+              </button>
+            </form>
+          </div>
+        </div>
+      </main>
+
+      <!-- COLUNA DIREITA: DETALHES DO TICKET / CRM -->
+      <aside id="painelDireito" class="hidden w-72 bg-white border-l border-slate-200 flex flex-col p-4 space-y-5 overflow-y-auto">
+        <div>
+          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">Controle do Chamado</h3>
+          <div class="space-y-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200/80">
+            <div>
+              <label class="block text-[11px] font-semibold text-slate-600 mb-1">Transferir Departamento</label>
+              <div class="flex gap-1.5">
+                <select id="selectTransferir" class="flex-1 text-xs border border-slate-300 rounded-lg px-2 py-1.5 bg-white"></select>
+                <button onclick="transferir()" class="bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold px-2.5 py-1.5 rounded-lg transition">
+                  Mover
+                </button>
+              </div>
+            </div>
+            <div class="pt-2 border-t border-slate-200">
+              <button onclick="encerrar()" class="w-full bg-rose-50 hover:bg-rose-600 text-rose-700 hover:text-white border border-rose-200 text-xs font-semibold py-2 rounded-lg transition">
+                Encerrar Atendimento
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex-1 flex flex-col">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Anotações Internas (CRM)</h3>
+          <textarea id="notasCrmInput" rows="5" placeholder="Registre observações sobre este cliente (visível apenas para a equipe)..."
+                    class="w-full border border-slate-200 rounded-xl p-2.5 text-xs focus:outline-none focus:border-emerald-500 bg-slate-50"></textarea>
+          <button onclick="salvarNotas()" class="mt-2 bg-slate-800 hover:bg-slate-900 text-white text-xs font-semibold py-2 rounded-lg transition">
+            Salvar Anotação
+          </button>
+        </div>
+      </aside>
+    </div>
+
+    <!-- ABA 2: GESTÃO DE PERFIS / DEPARTAMENTOS -->
+    <div id="abaPerfis" class="hidden flex-1 overflow-y-auto p-8">
+      <div class="max-w-5xl mx-auto space-y-6">
+        <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+          <h2 class="text-base font-bold text-slate-800">Novo Perfil / Departamento de Atendimento</h2>
+          <p class="text-xs text-slate-500 mt-0.5 mb-4">Os perfis criados aqui aparecem automaticamente no menu inicial do WhatsApp.</p>
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <input id="perfCodigo" type="text" placeholder="Código (ex: FINANCEIRO)" class="border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm uppercase" />
+            <input id="perfNome" type="text" placeholder="Nome (ex: Financeiro)" class="border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm" />
+            <input id="perfOpcao" type="text" placeholder="Tecla Menu (ex: 3)" class="border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm" />
+            <button onclick="criarPerfil()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl py-2.5 text-sm transition">
+              + Adicionar Perfil
+            </button>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+          <table class="w-full text-left text-sm">
+            <thead class="bg-slate-50 border-b border-slate-200 text-xs uppercase text-slate-500">
+              <tr>
+                <th class="px-5 py-3.5">Tecla Bot</th>
+                <th class="px-5 py-3.5">Identificador</th>
+                <th class="px-5 py-3.5">Nome do Departamento</th>
+                <th class="px-5 py-3.5 text-right">Ações</th>
+              </tr>
+            </thead>
+            <tbody id="tabelaPerfis" class="divide-y divide-slate-100"></tbody>
+          </table>
         </div>
       </div>
-    </main>
-  </div>
+    </div>
 
-  <!-- ABA 2: CADASTRO DE PERFIS / DEPARTAMENTOS -->
-  <div id="abaPerfis" class="hidden flex-1 overflow-y-auto p-8 max-w-4xl mx-auto w-full space-y-6">
-    <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
-      <h2 class="text-lg font-bold text-slate-800">Cadastrar Novo Perfil / Departamento</h2>
-      <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
-        <input id="perfCodigo" type="text" placeholder="Código (ex: FINANCEIRO)" class="border rounded-lg p-2.5 text-sm uppercase" />
-        <input id="perfNome" type="text" placeholder="Nome (ex: Financeiro)" class="border rounded-lg p-2.5 text-sm" />
-        <input id="perfOpcao" type="text" placeholder="Nº Menu (ex: 3)" class="border rounded-lg p-2.5 text-sm" />
-        <button onclick="criarPerfil()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg py-2.5 text-sm">
-          + Salvar Perfil
-        </button>
+    <!-- ABA 3: GESTÃO DE USUÁRIOS E VÍNCULOS -->
+    <div id="abaUsuarios" class="hidden flex-1 overflow-y-auto p-8">
+      <div class="max-w-5xl mx-auto space-y-6">
+        <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+          <h2 class="text-base font-bold text-slate-800">Cadastrar Operador e Vincular Perfil</h2>
+          <p class="text-xs text-slate-500 mt-0.5 mb-4">Cada atendente visualizará exclusivamente os chamados vinculados ao seu perfil.</p>
+          <div class="grid grid-cols-1 md:grid-cols-5 gap-3">
+            <input id="userNome" type="text" placeholder="Nome completo" class="border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm" />
+            <input id="userEmail" type="email" placeholder="E-mail de login" class="border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm" />
+            <input id="userSenha" type="password" placeholder="Senha" class="border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm" />
+            <select id="userPerfilSelect" class="border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm bg-white"></select>
+            <button onclick="criarUsuario()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl py-2.5 text-sm transition">
+              + Criar Acesso
+            </button>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+          <table class="w-full text-left text-sm">
+            <thead class="bg-slate-50 border-b border-slate-200 text-xs uppercase text-slate-500">
+              <tr>
+                <th class="px-5 py-3.5">Operador</th>
+                <th class="px-5 py-3.5">E-mail</th>
+                <th class="px-5 py-3.5">Nível</th>
+                <th class="px-5 py-3.5">Perfil Vinculado</th>
+                <th class="px-5 py-3.5 text-right">Ações</th>
+              </tr>
+            </thead>
+            <tbody id="tabelaUsuarios" class="divide-y divide-slate-100"></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-      <table class="w-full text-left text-sm">
-        <thead class="bg-slate-50 border-b text-slate-600">
-          <tr>
-            <th class="p-3">Opção Menu</th>
-            <th class="p-3">Código</th>
-            <th class="p-3">Nome do Perfil</th>
-            <th class="p-3 text-right">Ações</th>
-          </tr>
-        </thead>
-        <tbody id="tabelaPerfis" class="divide-y"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- ABA 3: CADASTRO DE USUÁRIOS E VÍNCULO COM PERFIL -->
-  <div id="abaUsuarios" class="hidden flex-1 overflow-y-auto p-8 max-w-5xl mx-auto w-full space-y-6">
-    <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
-      <h2 class="text-lg font-bold text-slate-800">Cadastrar Usuário e Vincular Perfil</h2>
-      <div class="grid grid-cols-1 md:grid-cols-5 gap-3">
-        <input id="userNome" type="text" placeholder="Nome do Atendente" class="border rounded-lg p-2.5 text-sm" />
-        <input id="userEmail" type="email" placeholder="E-mail de acesso" class="border rounded-lg p-2.5 text-sm" />
-        <input id="userSenha" type="password" placeholder="Senha" class="border rounded-lg p-2.5 text-sm" />
-        <select id="userPerfilSelect" class="border rounded-lg p-2.5 text-sm bg-white"></select>
-        <button onclick="criarUsuario()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-lg py-2.5 text-sm">
-          + Cadastrar Usuário
-        </button>
-      </div>
-    </div>
-
-    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-      <table class="w-full text-left text-sm">
-        <thead class="bg-slate-50 border-b text-slate-600">
-          <tr>
-            <th class="p-3">Nome</th>
-            <th class="p-3">E-mail</th>
-            <th class="p-3">Tipo</th>
-            <th class="p-3">Perfil Vinculado</th>
-            <th class="p-3 text-right">Ações</th>
-          </tr>
-        </thead>
-        <tbody id="tabelaUsuarios" class="divide-y"></tbody>
-      </table>
-    </div>
   </div>
 
   <script>
     let TOKEN = localStorage.getItem("tottem_token") || "";
     let USUARIO = JSON.parse(localStorage.getItem("tottem_user") || "null");
     let PERFIS = [];
+    let CHATS_CACHE = [];
     let JID_ATUAL = null;
     let intervalo = null;
     let mediaRecorder = null;
@@ -994,6 +1108,12 @@ HTML_PAINEL = """
       const h = { "Authorization": "Bearer " + TOKEN };
       if (json) h["Content-Type"] = "application/json";
       return h;
+    }
+
+    function iniciais(nome) {
+      if (!nome) return "CL";
+      const partes = nome.trim().split(" ");
+      return (partes[0][0] + (partes[1] ? partes[1][0] : "")).toUpperCase();
     }
 
     async function fazerLogin() {
@@ -1023,11 +1143,13 @@ HTML_PAINEL = """
 
     async function iniciarPainel() {
       document.getElementById("loginModal").classList.add("hidden");
-      document.getElementById("badgeUsuario").innerText = `${USUARIO.nome} • ${USUARIO.perfil_nome}`;
+      document.getElementById("badgeSetorAtual").innerText = USUARIO.perfil_nome;
+      document.getElementById("nomeOperadorTop").innerText = USUARIO.nome;
+      document.getElementById("avatarOperador").innerText = iniciais(USUARIO.nome);
 
       if (USUARIO.role === "ADMIN") {
-        document.getElementById("tabBtnPerfis").classList.remove("hidden");
-        document.getElementById("tabBtnUsuarios").classList.remove("hidden");
+        document.getElementById("railPerfis").classList.remove("hidden");
+        document.getElementById("railUsuarios").classList.remove("hidden");
         document.getElementById("filtroAdminSetor").classList.remove("hidden");
       }
 
@@ -1042,18 +1164,25 @@ HTML_PAINEL = """
 
     function mudarAba(aba) {
       ["abaAtendimento", "abaPerfis", "abaUsuarios"].forEach(id => document.getElementById(id).classList.add("hidden"));
-      ["tabBtnAtendimento", "tabBtnPerfis", "tabBtnUsuarios"].forEach(id => document.getElementById(id).classList.remove("bg-slate-700"));
+      ["railAtendimento", "railPerfis", "railUsuarios"].forEach(id => {
+        const el = document.getElementById(id);
+        el.classList.remove("bg-slate-800", "text-white");
+        el.classList.add("text-slate-400");
+      });
 
       if (aba === "atendimento") {
         document.getElementById("abaAtendimento").classList.remove("hidden");
-        document.getElementById("tabBtnAtendimento").classList.add("bg-slate-700");
+        document.getElementById("railAtendimento").classList.add("bg-slate-800", "text-white");
+        document.getElementById("tituloPagina").innerText = "Atendimentos";
       } else if (aba === "perfis") {
         document.getElementById("abaPerfis").classList.remove("hidden");
-        document.getElementById("tabBtnPerfis").classList.add("bg-slate-700");
+        document.getElementById("railPerfis").classList.add("bg-slate-800", "text-white");
+        document.getElementById("tituloPagina").innerText = "Perfis & Departamentos";
         carregarPerfis();
       } else if (aba === "usuarios") {
         document.getElementById("abaUsuarios").classList.remove("hidden");
-        document.getElementById("tabBtnUsuarios").classList.add("bg-slate-700");
+        document.getElementById("railUsuarios").classList.add("bg-slate-800", "text-white");
+        document.getElementById("tituloPagina").innerText = "Equipe & Vínculos";
         carregarUsuarios();
       }
     }
@@ -1063,25 +1192,19 @@ HTML_PAINEL = """
       if (!res.ok) return;
       PERFIS = await res.json();
 
-      const selTransf = document.getElementById("selectTransferir");
-      selTransf.innerHTML = PERFIS.map(p => `<option value="${p.codigo}">${p.nome}</option>`).join("");
-
-      const selFiltro = document.getElementById("filtroAdminSetor");
-      selFiltro.innerHTML = `<option value="TODOS">Todos os Departamentos</option>` +
+      document.getElementById("selectTransferir").innerHTML = PERFIS.map(p => `<option value="${p.codigo}">${p.nome}</option>`).join("");
+      document.getElementById("filtroAdminSetor").innerHTML = `<option value="TODOS">Todos os Departamentos</option>` +
         PERFIS.map(p => `<option value="${p.codigo}">${p.nome}</option>`).join("");
-
-      const selUserPerf = document.getElementById("userPerfilSelect");
-      selUserPerf.innerHTML = `<option value="">-- Admin (Acesso Global) --</option>` +
+      document.getElementById("userPerfilSelect").innerHTML = `<option value="">-- Admin (Acesso Global) --</option>` +
         PERFIS.map(p => `<option value="${p.id}">${p.nome}</option>`).join("");
 
-      const tbody = document.getElementById("tabelaPerfis");
-      tbody.innerHTML = PERFIS.map(p => `
-        <tr>
-          <td class="p-3 font-bold">${p.opcao_menu}</td>
-          <td class="p-3"><span class="bg-slate-200 px-2 py-0.5 rounded text-xs font-mono">${p.codigo}</span></td>
-          <td class="p-3">${p.nome}</td>
-          <td class="p-3 text-right">
-            <button onclick="excluirPerfil(${p.id})" class="text-rose-600 hover:underline text-xs">Excluir</button>
+      document.getElementById("tabelaPerfis").innerHTML = PERFIS.map(p => `
+        <tr class="hover:bg-slate-50">
+          <td class="px-5 py-3.5"><span class="w-7 h-7 rounded-lg bg-emerald-100 text-emerald-800 font-bold inline-flex items-center justify-center text-xs">${p.opcao_menu}</span></td>
+          <td class="px-5 py-3.5"><span class="bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-md text-xs font-mono font-semibold text-slate-700">${p.codigo}</span></td>
+          <td class="px-5 py-3.5 font-medium text-slate-800">${p.nome}</td>
+          <td class="px-5 py-3.5 text-right">
+            <button onclick="excluirPerfil(${p.id})" class="text-rose-600 hover:bg-rose-50 px-3 py-1 rounded-lg text-xs font-medium transition">Remover</button>
           </td>
         </tr>
       `).join("");
@@ -1119,20 +1242,19 @@ HTML_PAINEL = """
       const res = await fetch("/api/admin/usuarios", { headers: authHeaders() });
       if (!res.ok) return;
       const users = await res.json();
-      const tbody = document.getElementById("tabelaUsuarios");
-      tbody.innerHTML = users.map(u => `
-        <tr>
-          <td class="p-3 font-medium">${u.nome}</td>
-          <td class="p-3 text-slate-600">${u.email}</td>
-          <td class="p-3"><span class="text-xs font-bold px-2 py-0.5 rounded bg-slate-200">${u.role}</span></td>
-          <td class="p-3">
-            <select onchange="alterarVinculoUsuario(${u.id}, '${u.nome}', '${u.email}', this.value)" class="border rounded p-1 text-xs bg-white">
+      document.getElementById("tabelaUsuarios").innerHTML = users.map(u => `
+        <tr class="hover:bg-slate-50">
+          <td class="px-5 py-3.5 font-semibold text-slate-800">${u.nome}</td>
+          <td class="px-5 py-3.5 text-slate-500">${u.email}</td>
+          <td class="px-5 py-3.5"><span class="text-[11px] font-bold px-2.5 py-0.5 rounded-full ${u.role==='ADMIN' ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'}">${u.role}</span></td>
+          <td class="px-5 py-3.5">
+            <select onchange="alterarVinculoUsuario(${u.id}, '${u.nome}', '${u.email}', this.value)" class="border border-slate-300 rounded-lg px-2.5 py-1.5 text-xs bg-white font-medium">
               <option value="" ${!u.perfil_id ? 'selected' : ''}>Supervisão / Admin (Global)</option>
               ${PERFIS.map(p => `<option value="${p.id}" ${u.perfil_id === p.id ? 'selected' : ''}>${p.nome}</option>`).join("")}
             </select>
           </td>
-          <td class="p-3 text-right">
-            <button onclick="excluirUsuario(${u.id})" class="text-rose-600 hover:underline text-xs">Excluir</button>
+          <td class="px-5 py-3.5 text-right">
+            <button onclick="excluirUsuario(${u.id})" class="text-rose-600 hover:bg-rose-50 px-3 py-1 rounded-lg text-xs font-medium transition">Excluir</button>
           </td>
         </tr>
       `).join("");
@@ -1194,29 +1316,67 @@ HTML_PAINEL = """
       const filtro = document.getElementById("filtroAdminSetor").value || "TODOS";
       const res = await fetch(`/api/painel/chats?filtro_setor=${filtro}`, { headers: authHeaders() });
       if (!res.ok) return;
-      const chats = await res.json();
-      document.getElementById("contadorChats").innerText = chats.length;
-
-      document.getElementById("listaChats").innerHTML = chats.map(c => `
-        <div onclick="selecionarChat('${c.jid}', '${(c.nome || '').replace(/'/g, '')}')"
-             class="p-3.5 cursor-pointer hover:bg-slate-50 ${JID_ATUAL === c.jid ? 'bg-emerald-50 border-l-4 border-emerald-600' : ''}">
-          <div class="flex justify-between items-center">
-            <span class="font-semibold text-slate-800 text-sm">${c.nome || c.jid.split('@')[0]}</span>
-            ${c.nao_lidas > 0 ? `<span class="bg-emerald-600 text-white text-xs font-bold px-2 py-0.5 rounded-full">${c.nao_lidas}</span>` : ''}
-          </div>
-          <p class="text-xs text-slate-500 truncate mt-1">${c.ultima_mensagem || ''}</p>
-          <span class="inline-block mt-1 text-[10px] font-bold px-2 py-0.5 rounded bg-slate-200 text-slate-700">${c.setor}</span>
-        </div>
-      `).join("");
+      CHATS_CACHE = await res.json();
+      renderizarListaChats();
     }
 
-    function selecionarChat(jid, nome) {
+    function renderizarListaChats() {
+      const termo = (document.getElementById("buscaContato").value || "").toLowerCase();
+      const filtrados = CHATS_CACHE.filter(c =>
+        (c.nome || "").toLowerCase().includes(termo) || (c.jid || "").includes(termo)
+      );
+      document.getElementById("contadorChats").innerText = filtrados.length;
+
+      document.getElementById("listaChats").innerHTML = filtrados.map(c => {
+        const ativo = JID_ATUAL === c.jid;
+        return `
+          <div onclick="selecionarChat('${c.jid}')"
+               class="p-3.5 cursor-pointer transition flex items-start gap-3 ${ativo ? 'bg-emerald-50/80 border-l-4 border-emerald-600' : 'hover:bg-slate-50'}">
+            <div class="w-10 h-10 rounded-full bg-slate-800 text-white font-bold text-xs flex items-center justify-center shrink-0">
+              ${iniciais(c.nome || c.jid)}
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="flex justify-between items-center">
+                <span class="font-semibold text-slate-800 text-xs truncate">${c.nome || c.jid.split('@')[0]}</span>
+                <span class="text-[10px] text-slate-400">${c.hora_fmt || ''}</span>
+              </div>
+              <p class="text-xs text-slate-500 truncate mt-0.5">${c.ultima_mensagem || ''}</p>
+              <div class="flex items-center justify-between mt-1.5">
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">${c.setor}</span>
+                ${c.nao_lidas > 0 ? `<span class="bg-emerald-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-full">${c.nao_lidas}</span>` : ''}
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function selecionarChat(jid) {
       JID_ATUAL = jid;
+      const chat = CHATS_CACHE.find(c => c.jid === jid) || {};
       document.getElementById("chatVazio").classList.add("hidden");
       document.getElementById("chatAtivo").classList.remove("hidden");
-      document.getElementById("contatoNome").innerText = nome || jid.split("@")[0];
+      document.getElementById("painelDireito").classList.remove("hidden");
+
+      const nome = chat.nome || jid.split("@")[0];
+      document.getElementById("contatoNome").innerText = nome;
       document.getElementById("contatoNumero").innerText = "+" + jid.split("@")[0];
+      document.getElementById("avatarClienteChat").innerText = iniciais(nome);
+      document.getElementById("badgeSetorChat").innerText = chat.setor || "ATENDIMENTO";
+      document.getElementById("notasCrmInput").value = chat.notas_crm || "";
+
       carregarMensagens(jid, true);
+      renderizarListaChats();
+    }
+
+    async function salvarNotas() {
+      if (!JID_ATUAL) return;
+      const notas = document.getElementById("notasCrmInput").value;
+      await fetch("/api/painel/notas", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ jid: JID_ATUAL, notas_crm: notas })
+      });
       atualizarFila();
     }
 
@@ -1224,15 +1384,15 @@ HTML_PAINEL = """
       if (!m.url_midia) return "";
       const tipo = (m.tipo_midia || "").toUpperCase();
       if (tipo === "IMAGE" || tipo === "STICKER") {
-        return `<img src="${m.url_midia}" class="max-w-xs rounded-lg my-1 border" />`;
+        return `<img src="${m.url_midia}" onclick="window.open('${m.url_midia}')" class="max-w-xs rounded-lg my-1.5 border cursor-pointer hover:opacity-95" />`;
       }
       if (tipo === "AUDIO" || tipo === "VOICE") {
-        return `<audio controls src="${m.url_midia}" class="my-1 max-w-xs"></audio>`;
+        return `<audio controls src="${m.url_midia}" class="my-1.5 max-w-xs h-9"></audio>`;
       }
       if (tipo === "VIDEO") {
-        return `<video controls src="${m.url_midia}" class="max-w-xs rounded-lg my-1"></video>`;
+        return `<video controls src="${m.url_midia}" class="max-w-xs rounded-lg my-1.5"></video>`;
       }
-      return `<a href="${m.url_midia}" target="_blank" class="inline-block my-1 text-xs bg-slate-200 hover:bg-slate-300 px-3 py-1.5 rounded font-semibold text-slate-800">📄 Baixar Anexo</a>`;
+      return `<a href="${m.url_midia}" target="_blank" class="inline-flex items-center gap-1.5 my-1.5 text-xs bg-slate-100 hover:bg-slate-200 border border-slate-300 px-3 py-2 rounded-lg font-semibold text-slate-800">📄 Baixar Documento</a>`;
     }
 
     async function carregarMensagens(jid, rolarFim) {
@@ -1242,12 +1402,13 @@ HTML_PAINEL = """
       const area = document.getElementById("areaMensagens");
       area.innerHTML = msgs.map(m => {
         const isCliente = m.remetente === "CLIENTE";
+        const isBot = m.remetente === "BOT";
         return `
           <div class="flex ${isCliente ? 'justify-start' : 'justify-end'}">
-            <div class="max-w-md rounded-xl px-4 py-2 shadow-sm text-sm ${isCliente ? 'bg-white text-slate-800' : 'bg-emerald-100 text-slate-900'}">
-              <div class="text-[10px] font-bold text-slate-500 mb-0.5">${m.remetente}</div>
+            <div class="max-w-md rounded-2xl px-4 py-2.5 shadow-sm text-sm ${isCliente ? 'bg-white text-slate-800 rounded-tl-none' : (isBot ? 'bg-slate-200/90 text-slate-700' : 'bg-[#d9fdd3] text-slate-900 rounded-tr-none')}">
+              <div class="text-[10px] font-bold ${isCliente ? 'text-emerald-700' : 'text-slate-500'} mb-0.5">${m.remetente}</div>
               ${renderizarMidia(m)}
-              <div class="whitespace-pre-line">${m.conteudo}</div>
+              <div class="whitespace-pre-line leading-relaxed">${m.conteudo}</div>
               <div class="text-[10px] text-right text-slate-400 mt-1">${m.hora}</div>
             </div>
           </div>
@@ -1300,6 +1461,7 @@ HTML_PAINEL = """
 
     async function alternarGravacaoAudio() {
       const btn = document.getElementById("btnGravarAudio");
+      const status = document.getElementById("statusGravacao");
       if (!mediaRecorder || mediaRecorder.state === "inactive") {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1312,7 +1474,7 @@ HTML_PAINEL = """
             formData.append("jid", JID_ATUAL);
             formData.append("tipo", "voice");
             formData.append("legenda", "");
-            formData.append("arquivo", blob, "audio_gravado.webm");
+            formData.append("arquivo", blob, "voz.webm");
 
             await fetch("/api/painel/enviar-midia", {
               method: "POST",
@@ -1324,16 +1486,16 @@ HTML_PAINEL = """
           };
           mediaRecorder.start();
           btn.classList.replace("bg-slate-100", "bg-rose-600");
-          btn.classList.add("text-white");
-          btn.innerText = "⏹️";
+          btn.classList.replace("text-slate-600", "text-white");
+          status.classList.remove("hidden");
         } catch (err) {
-          alert("Permita o acesso ao microfone no navegador para gravar áudios.");
+          alert("Permita o acesso ao microfone no navegador.");
         }
       } else {
         mediaRecorder.stop();
         btn.classList.replace("bg-rose-600", "bg-slate-100");
-        btn.classList.remove("text-white");
-        btn.innerText = "🎤";
+        btn.classList.replace("text-white", "text-slate-600");
+        status.classList.add("hidden");
       }
     }
 
@@ -1347,12 +1509,13 @@ HTML_PAINEL = """
       });
       JID_ATUAL = null;
       document.getElementById("chatAtivo").classList.add("hidden");
+      document.getElementById("painelDireito").classList.add("hidden");
       document.getElementById("chatVazio").classList.remove("hidden");
       atualizarFila();
     }
 
     async function encerrar() {
-      if (!JID_ATUAL || !confirm("Encerrar este atendimento?")) return;
+      if (!JID_ATUAL || !confirm("Deseja encerrar este atendimento?")) return;
       await fetch("/api/painel/encerrar", {
         method: "POST",
         headers: authHeaders(),
@@ -1360,6 +1523,7 @@ HTML_PAINEL = """
       });
       JID_ATUAL = null;
       document.getElementById("chatAtivo").classList.add("hidden");
+      document.getElementById("painelDireito").classList.add("hidden");
       document.getElementById("chatVazio").classList.remove("hidden");
       atualizarFila();
     }
