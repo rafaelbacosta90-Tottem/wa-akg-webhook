@@ -2,7 +2,6 @@ import os
 import re
 import io
 import csv
-import ssl
 import time
 import uuid
 import random
@@ -12,11 +11,11 @@ import secrets
 import logging
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 import httpx
-import pymysql
+import psycopg2
+import psycopg2.extras
 import openpyxl
 import imageio_ffmpeg
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, UploadFile, File, Form
@@ -27,10 +26,10 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("tottem-atendimento")
 
-app = FastAPI(title="Tottem OmniDesk — Atendimento & CRM Corporativo")
+app = FastAPI(title="Tottem OmniDesk — Atendimento & Prospecção Supabase")
 
 # ==============================================================================
-# VARIÁVEIS DE AMBIENTE (RENDER)
+# VARIÁVEIS DE AMBIENTE (RENDER -> SUPABASE POSTGRESQL)
 # ==============================================================================
 WA_BASE_URL = os.getenv("WA_BASE_URL", "https://zap.tottemtecnologia.com.br/api").rstrip("/")
 SESSION_ID = os.getenv("SESSION_ID", "")
@@ -64,10 +63,14 @@ CAMPANHA_STATUS = {
 
 
 # ==============================================================================
-# SEGURANÇA, NORMALIZAÇÃO DE TELEFONE E ÁUDIO OGG/OPUS
+# SEGURANÇA, NORMALIZAÇÃO DE TELEFONE/CNPJ E ÁUDIO OGG/OPUS
 # ==============================================================================
 def hash_senha(senha: str) -> str:
     return hashlib.sha256(senha.encode("utf-8")).hexdigest()
+
+
+def limpar_digitos(valor: Any) -> str:
+    return re.sub(r"\D", "", str(valor or ""))
 
 
 def converter_para_ogg(origem: Path) -> Path:
@@ -85,7 +88,7 @@ def converter_para_ogg(origem: Path) -> Path:
 def normalizar_numero_wa(celular: str, telefone: str = "") -> Optional[str]:
     """Prioriza celular; se vazio, usa telefone. Retorna JID formatado (55...)."""
     for bruto in (celular, telefone):
-        digitos = re.sub(r"\D", "", str(bruto or ""))
+        digitos = limpar_digitos(bruto)
         if digitos.startswith("0"):
             digitos = digitos.lstrip("0")
         if len(digitos) >= 10:
@@ -95,17 +98,17 @@ def normalizar_numero_wa(celular: str, telefone: str = "") -> Optional[str]:
     return None
 
 
-def extrair_jids_lead(lead: Dict[str, Any], enviar_ambos: bool = False) -> List[str]:
-    """Retorna a lista de JIDs únicos do lead conforme a opção de enviar para ambos os números."""
-    jid_cel = normalizar_numero_wa(lead.get("celular", ""))
-    jid_tel = normalizar_numero_wa(lead.get("telefone", ""))
+def extrair_jids_contato(contato: Dict[str, Any], enviar_ambos: bool = False) -> List[str]:
+    """Retorna a lista de JIDs únicos do contato conforme a opção de enviar para ambos os números."""
+    jid_cel = normalizar_numero_wa(contato.get("celular", ""))
+    jid_tel = normalizar_numero_wa(contato.get("telefone", ""))
 
     if not enviar_ambos:
-        principal = jid_cel or jid_tel or lead.get("jid")
+        principal = jid_cel or jid_tel or contato.get("jid")
         return [principal] if principal else []
 
     jids: List[str] = []
-    for j in (jid_cel, jid_tel, lead.get("jid")):
+    for j in (jid_cel, jid_tel, contato.get("jid")):
         if j and j not in jids:
             jids.append(j)
             if not jid_cel or not jid_tel:
@@ -113,14 +116,14 @@ def extrair_jids_lead(lead: Dict[str, Any], enviar_ambos: bool = False) -> List[
     return jids
 
 
-def aplicar_variaveis_template(template: str, lead: Dict[str, Any]) -> str:
+def aplicar_variaveis_template(template: str, contato: Dict[str, Any]) -> str:
     texto = template
     mapa = {
-        "{nome}": lead.get("nome") or lead.get("razao_social") or "Cliente",
-        "{razao_social}": lead.get("razao_social") or lead.get("nome") or "",
-        "{cnpj}": lead.get("cnpj") or "",
-        "{telefone}": lead.get("telefone") or "",
-        "{celular}": lead.get("celular") or "",
+        "{nome}": contato.get("nome") or contato.get("razao_social") or "Cliente",
+        "{razao_social}": contato.get("razao_social") or contato.get("nome") or "",
+        "{cnpj}": contato.get("cnpj") or "",
+        "{telefone}": contato.get("telefone") or "",
+        "{celular}": contato.get("celular") or "",
     }
     for chave, valor in mapa.items():
         texto = texto.replace(chave, str(valor))
@@ -189,58 +192,48 @@ def ler_planilha_bruta(conteudo: bytes, filename: str) -> Dict[str, Any]:
 
 
 # ==============================================================================
-# BANCO DE DADOS MYSQL (AIVEN)
+# BANCO DE DADOS POSTGRESQL (SUPABASE)
 # ==============================================================================
 def get_db_connection():
     if not DATABASE_URL:
         raise RuntimeError("Variável DATABASE_URL não configurada.")
-    parsed = urlparse(DATABASE_URL)
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    return pymysql.connect(
-        host=parsed.hostname,
-        port=parsed.port or 3306,
-        user=parsed.username,
-        password=parsed.password,
-        database=parsed.path.lstrip("/"),
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True,
-        ssl=ssl_ctx,
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        cursor_factory=psycopg2.extras.RealDictCursor,
     )
+    conn.autocommit = True
+    return conn
 
 
 def init_db():
+    """Cria apenas as tabelas exclusivas do OmniDesk, mantendo clientes e pessoas intactas."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS perfis_atendimento (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                     codigo VARCHAR(30) UNIQUE NOT NULL,
                     nome VARCHAR(100) NOT NULL,
                     opcao_menu VARCHAR(10) NOT NULL,
                     descricao VARCHAR(255) DEFAULT '',
-                    criado_em DATETIME DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS usuarios_painel (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                     nome VARCHAR(120) NOT NULL,
                     email VARCHAR(150) UNIQUE NOT NULL,
                     senha_hash VARCHAR(255) NOT NULL,
                     role VARCHAR(20) DEFAULT 'ATENDENTE',
-                    perfil_id INT NULL,
+                    perfil_id INT NULL REFERENCES perfis_atendimento(id) ON DELETE SET NULL,
                     token_sessao VARCHAR(120) NULL,
-                    ativo TINYINT(1) DEFAULT 1,
-                    criado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT fk_usuario_perfil FOREIGN KEY (perfil_id)
-                        REFERENCES perfis_atendimento(id) ON DELETE SET NULL
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    ativo SMALLINT DEFAULT 1,
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
             cur.execute("""
@@ -252,82 +245,87 @@ def init_db():
                     ultima_mensagem TEXT,
                     notas_crm TEXT,
                     nao_lidas INT DEFAULT 0,
-                    atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS mensagens_atendimento (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                     jid VARCHAR(100) NOT NULL,
                     remetente VARCHAR(80) NOT NULL,
                     conteudo TEXT NOT NULL,
                     tipo_midia VARCHAR(20) DEFAULT 'TEXT',
                     url_midia VARCHAR(255) NULL,
-                    criado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_jid (jid)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_jid ON mensagens_atendimento(jid);")
 
+            # Tabela dedicada aos contatos importados para disparo (separada de clientes e pessoas)
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS leads_crm (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS contatos_importados (
+                    id SERIAL PRIMARY KEY,
                     cnpj VARCHAR(30) DEFAULT '',
                     nome VARCHAR(180) DEFAULT '',
                     razao_social VARCHAR(220) DEFAULT '',
                     telefone VARCHAR(40) DEFAULT '',
                     celular VARCHAR(40) DEFAULT '',
                     jid VARCHAR(100) UNIQUE NOT NULL,
-                    status_lead VARCHAR(30) DEFAULT 'NOVO',
+                    status_contato VARCHAR(30) DEFAULT 'nao_enviado',
                     origem VARCHAR(100) DEFAULT 'PLANILHA',
-                    ultimo_disparo DATETIME NULL,
-                    criado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_cnpj (cnpj),
-                    INDEX idx_status (status_lead)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    ultimo_disparo TIMESTAMP NULL,
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_contatos_imp_cnpj ON contatos_importados(cnpj);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_contatos_imp_status ON contatos_importados(status_contato);")
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS templates_disparo (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
                     titulo VARCHAR(120) NOT NULL,
                     conteudo TEXT NOT NULL,
-                    criado_em DATETIME DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS config_antiban (
                     id INT PRIMARY KEY,
-                    habilitado TINYINT(1) DEFAULT 1,
+                    habilitado SMALLINT DEFAULT 1,
                     limite_mensagens INT DEFAULT 5,
                     janela_segundos INT DEFAULT 10,
                     atraso_min_ms INT DEFAULT 1000,
                     atraso_max_ms INT DEFAULT 3000,
-                    atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
             """)
 
             cur.execute("""
-                INSERT IGNORE INTO config_antiban
+                INSERT INTO config_antiban
                     (id, habilitado, limite_mensagens, janela_segundos, atraso_min_ms, atraso_max_ms)
                 VALUES (1, 1, 5, 10, 1000, 3000)
+                ON CONFLICT (id) DO NOTHING;
             """)
 
             cur.execute("""
-                INSERT IGNORE INTO templates_disparo (id, titulo, conteudo)
+                INSERT INTO templates_disparo (id, titulo, conteudo)
                 VALUES (
                     1,
                     'Apresentação Comercial B2B',
-                    'Olá *{nome}* da empresa *{razao_social}* (CNPJ: {cnpj})! 👋\n\nSomos da *Tottem Tecnologia* e gostaríamos de apresentar nossas soluções para impulsionar seus resultados. Podemos conversar?'
+                    E'Olá *{nome}* da empresa *{razao_social}* (CNPJ: {cnpj})! 👋\n\nSomos da *Tottem Tecnologia* e gostaríamos de apresentar nossas soluções para impulsionar seus resultados. Podemos conversar?'
                 )
+                ON CONFLICT (id) DO NOTHING;
             """)
+            cur.execute("SELECT setval(pg_get_serial_sequence('templates_disparo', 'id'), COALESCE((SELECT MAX(id) FROM templates_disparo), 1), true);")
 
             cur.execute("""
-                INSERT IGNORE INTO perfis_atendimento (codigo, nome, opcao_menu, descricao)
+                INSERT INTO perfis_atendimento (codigo, nome, opcao_menu, descricao)
                 VALUES
                     ('SUPORTE', 'Suporte Técnico', '1', 'Atendimento técnico e chamados'),
                     ('COMERCIAL', 'Comercial e Orçamentos', '2', 'Vendas, propostas e licitações')
+                ON CONFLICT (codigo) DO NOTHING;
             """)
 
             cur.execute("SELECT id FROM usuarios_painel WHERE email = %s", (ADMIN_EMAIL,))
@@ -339,7 +337,7 @@ def init_db():
                     """,
                     ("Administrador", ADMIN_EMAIL, hash_senha(ADMIN_SENHA)),
                 )
-        logger.info("Banco de dados CRM & Atendimento sincronizado.")
+        logger.info("Banco de dados Supabase (OmniDesk) sincronizado sem alterar tabelas existentes.")
     finally:
         conn.close()
 
@@ -359,7 +357,7 @@ def obter_config_antiban_db() -> Dict[str, Any]:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM config_antiban WHERE id = 1")
             cfg = cur.fetchone()
-            return cfg or {
+            return dict(cfg) if cfg else {
                 "habilitado": 1,
                 "limite_mensagens": 5,
                 "janela_segundos": 10,
@@ -407,7 +405,10 @@ async def enviar_texto_wa(jid: str, texto: str) -> bool:
     async with httpx.AsyncClient(timeout=20.0) as client:
         try:
             resp = await client.post(url, json=payload, headers=HEADERS_WA_JSON)
-            return resp.status_code in (200, 201)
+            if resp.status_code not in (200, 201):
+                logger.error(f"Falha envio WA [{resp.status_code}]: {resp.text[:200]}")
+                return False
+            return True
         except Exception as e:
             logger.error(f"Erro envio texto WA: {e}")
             return False
@@ -504,19 +505,16 @@ def registrar_mensagem(
             cur.execute("""
                 INSERT INTO atendimentos (jid, nome, setor, status, ultima_mensagem, nao_lidas, atualizado_em)
                 VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                ON DUPLICATE KEY UPDATE
-                    nome = IF(%s != '', %s, nome),
-                    setor = IF(%s IS NOT NULL, %s, setor),
-                    status = IF(%s IS NOT NULL, %s, status),
-                    ultima_mensagem = %s,
-                    nao_lidas = nao_lidas + %s,
+                ON CONFLICT (jid) DO UPDATE SET
+                    nome = CASE WHEN EXCLUDED.nome != '' THEN EXCLUDED.nome ELSE atendimentos.nome END,
+                    setor = COALESCE(%s, atendimentos.setor),
+                    status = COALESCE(%s, atendimentos.status),
+                    ultima_mensagem = EXCLUDED.ultima_mensagem,
+                    nao_lidas = atendimentos.nao_lidas + EXCLUDED.nao_lidas,
                     atualizado_em = NOW()
             """, (
                 jid, nome, setor_ins, status_ins, resumo, inc,
-                nome, nome,
-                setor_padrao, setor_padrao,
-                status_padrao, status_padrao,
-                resumo, inc
+                setor_padrao, status_padrao
             ))
     finally:
         conn.close()
@@ -574,14 +572,12 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
                 atendimento = cur.fetchone()
                 cur.execute("SELECT * FROM perfis_atendimento ORDER BY opcao_menu ASC")
                 perfis = cur.fetchall()
-                cur.execute("SELECT * FROM leads_crm WHERE jid = %s", (jid,))
-                lead = cur.fetchone()
-                if lead:
-                    cur.execute("UPDATE leads_crm SET status_lead = 'EM_ATENDIMENTO' WHERE jid = %s", (jid,))
+                cur.execute("SELECT * FROM contatos_importados WHERE jid = %s", (jid,))
+                contato = cur.fetchone()
         finally:
             conn.close()
 
-        nome_exibicao = (lead["nome"] or lead["razao_social"]) if lead else push_name
+        nome_exibicao = (contato["nome"] or contato["razao_social"]) if contato else push_name
         status_atual = atendimento["status"] if atendimento else "TRIAGEM"
 
         registrar_mensagem(
@@ -690,17 +686,21 @@ class AntiBanReq(BaseModel):
 class DisparoMassaReq(BaseModel):
     template_id: int
     setor_destino: str
-    status_filtro: str = "NOVO"
+    status_filtro: str = "nao_enviado"
     enviar_ambos_numeros: bool = False
-    lead_ids: List[int] = []
+    contato_ids: List[int] = []
 
 
-class ExcluirMassaLeadsReq(BaseModel):
+class ExcluirMassaContatosReq(BaseModel):
     ids: List[int]
 
 
-class IniciarChatLeadReq(BaseModel):
-    lead_id: int
+class AlterarStatusContatoReq(BaseModel):
+    status_contato: str
+
+
+class IniciarChatContatoReq(BaseModel):
+    contato_id: int
     setor_destino: str
 
 
@@ -722,7 +722,7 @@ def obter_usuario_atual(request: Request) -> Dict[str, Any]:
             user = cur.fetchone()
             if not user:
                 raise HTTPException(status_code=401, detail="Sessão inválida")
-            return user
+            return dict(user)
     finally:
         conn.close()
 
@@ -794,7 +794,7 @@ def criar_perfil(dados: PerfilReq, request: Request):
                 (dados.codigo.strip().upper(), dados.nome.strip(), dados.opcao_menu.strip(), dados.descricao.strip()),
             )
         return {"status": "criado"}
-    except pymysql.err.IntegrityError:
+    except psycopg2.IntegrityError:
         raise HTTPException(status_code=400, detail="Código já existe.")
     finally:
         conn.close()
@@ -849,7 +849,7 @@ def criar_usuario(dados: UsuarioReq, request: Request):
                 (dados.nome.strip(), dados.email.strip().lower(), hash_senha(dados.senha), dados.role, dados.perfil_id),
             )
         return {"status": "criado"}
-    except pymysql.err.IntegrityError:
+    except psycopg2.IntegrityError:
         raise HTTPException(status_code=400, detail="E-mail já cadastrado.")
     finally:
         conn.close()
@@ -890,23 +890,129 @@ def excluir_usuario(usuario_id: int, request: Request):
         conn.close()
 
 
-# --- ROTAS CRM LEADS: PREVIEW + MAPEAMENTO DE COLUNAS + IMPORTAÇÃO ---
-@app.get("/api/admin/leads")
-def listar_leads(request: Request):
+# --- ROTAS CONTATOS IMPORTADOS: LISTAGEM, SINCRONIZAÇÃO COM PESSOAS, PREVIEW E IMPORTAÇÃO ---
+@app.get("/api/admin/contatos")
+def listar_contatos_importados(request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM leads_crm ORDER BY id DESC LIMIT 1000")
+            cur.execute("SELECT * FROM contatos_importados ORDER BY id DESC LIMIT 2000")
             return cur.fetchall()
     finally:
         conn.close()
 
 
-@app.post("/api/admin/leads/preview")
-async def preview_planilha_leads(request: Request, arquivo: UploadFile = File(...)):
-    """Lê a planilha enviada e retorna as colunas e uma prévia das 10 primeiras linhas para mapeamento."""
+@app.post("/api/admin/contatos/sincronizar-pessoas")
+def sincronizar_com_tabela_pessoas(request: Request):
+    """
+    Sincroniza contatos_importados com a tabela pessoas (somente leitura na tabela pessoas):
+    1. Se CNPJ em pessoas tiver status_venda = COMPROU (ou CONVERTIDO), APAGA de contatos_importados.
+    2. Se CNPJ em pessoas tiver status_venda = NAO_COMPROU / NÃO COMPROU, marca como 'nao_comprou'
+       (ou importa em contatos_importados caso ainda não esteja lá).
+    """
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+
+    conn = get_db_connection()
+    removidos_comprou = 0
+    marcados_nao_comprou = 0
+    novos_nao_comprou = 0
+
+    try:
+        with conn.cursor() as cur:
+            # Verifica se a tabela pessoas existe no schema public
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'pessoas'
+                ) AS existe;
+            """)
+            if not cur.fetchone()["existe"]:
+                raise HTTPException(status_code=404, detail="Tabela 'pessoas' não encontrada neste banco Supabase.")
+
+            cur.execute("SELECT cnpj, razao_social, nome_fantasia, telefone, status_venda FROM pessoas")
+            pessoas_rows = cur.fetchall()
+
+            cur.execute("SELECT id, cnpj, jid, status_contato FROM contatos_importados")
+            contatos_rows = cur.fetchall()
+
+            mapa_contatos_por_cnpj: Dict[str, List[Dict[str, Any]]] = {}
+            for c in contatos_rows:
+                cnpj_limpo = limpar_digitos(c.get("cnpj"))
+                if cnpj_limpo:
+                    mapa_contatos_por_cnpj.setdefault(cnpj_limpo, []).append(c)
+
+            for p in pessoas_rows:
+                cnpj_limpo = limpar_digitos(p.get("cnpj"))
+                if not cnpj_limpo:
+                    continue
+
+                status_raw = (p.get("status_venda") or "").strip().upper()
+                status_norm = (
+                    status_raw.replace("Ã", "A")
+                    .replace("Á", "A")
+                    .replace("É", "E")
+                    .replace("Í", "I")
+                    .replace("Ó", "O")
+                    .replace("Ú", "U")
+                )
+
+                existentes = mapa_contatos_por_cnpj.get(cnpj_limpo, [])
+
+                # Regra 1: Só apaga de contatos_importados quando na tabela pessoas estiver COMPROU
+                if "NAO" not in status_norm and ("COMPROU" in status_norm or "CONVERTIDO" in status_norm):
+                    if existentes:
+                        ids_remover = [item["id"] for item in existentes]
+                        cur.execute("DELETE FROM contatos_importados WHERE id = ANY(%s)", (ids_remover,))
+                        removidos_comprou += cur.rowcount
+
+                # Regra 2: Se estiver NAO COMPROU na tabela pessoas, marca/insere como 'nao_comprou'
+                elif "NAO" in status_norm and "COMPROU" in status_norm:
+                    if existentes:
+                        for item in existentes:
+                            if item.get("status_contato") != "nao_comprou":
+                                cur.execute(
+                                    "UPDATE contatos_importados SET status_contato = 'nao_comprou' WHERE id = %s",
+                                    (item["id"],),
+                                )
+                                marcados_nao_comprou += 1
+                    else:
+                        tel_p = p.get("telefone") or ""
+                        jid_p = normalizar_numero_wa(tel_p, tel_p)
+                        if jid_p:
+                            dig = limpar_digitos(tel_p)
+                            is_cel = len(dig) in (11, 13)
+                            cur.execute("""
+                                INSERT INTO contatos_importados
+                                    (cnpj, nome, razao_social, telefone, celular, jid, status_contato, origem)
+                                VALUES (%s, %s, %s, %s, %s, %s, 'nao_comprou', 'TABELA_PESSOAS')
+                                ON CONFLICT (jid) DO UPDATE SET
+                                    cnpj = CASE WHEN EXCLUDED.cnpj != '' THEN EXCLUDED.cnpj ELSE contatos_importados.cnpj END,
+                                    status_contato = 'nao_comprou'
+                            """, (
+                                p.get("cnpj") or "",
+                                p.get("nome_fantasia") or p.get("razao_social") or "",
+                                p.get("razao_social") or "",
+                                "" if is_cel else tel_p,
+                                tel_p if is_cel else "",
+                                jid_p,
+                            ))
+                            novos_nao_comprou += 1
+
+        return {
+            "status": "ok",
+            "removidos_comprou": removidos_comprou,
+            "marcados_nao_comprou": marcados_nao_comprou,
+            "novos_nao_comprou": novos_nao_comprou,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/contatos/preview")
+async def preview_planilha_contatos(request: Request, arquivo: UploadFile = File(...)):
     user = obter_usuario_atual(request)
     exigir_admin(user)
 
@@ -923,7 +1029,7 @@ async def preview_planilha_leads(request: Request, arquivo: UploadFile = File(..
     }
 
 
-@app.post("/api/admin/leads/importar-mapeado")
+@app.post("/api/admin/contatos/importar-mapeado")
 async def importar_planilha_mapeada(
     request: Request,
     arquivo: UploadFile = File(...),
@@ -933,7 +1039,7 @@ async def importar_planilha_mapeada(
     col_telefone: str = Form(""),
     col_celular: str = Form(""),
 ):
-    """Importa os dados da planilha usando o vínculo de colunas escolhido pelo administrador."""
+    """Importa a planilha para contatos_importados (ignorando CNPJs que já estejam como COMPROU na tabela pessoas)."""
     user = obter_usuario_atual(request)
     exigir_admin(user)
 
@@ -962,9 +1068,31 @@ async def importar_planilha_mapeada(
 
     importados = 0
     ignorados = 0
+    ignorados_ja_comprou = 0
+
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            # Consulta CNPJs que já compraram na tabela pessoas para não importar de novo
+            cnpjs_comprados = set()
+            cnpjs_nao_compraram = set()
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'pessoas'
+                ) AS existe;
+            """)
+            if cur.fetchone()["existe"]:
+                cur.execute("SELECT cnpj, status_venda FROM pessoas")
+                for p in cur.fetchall():
+                    c_dig = limpar_digitos(p.get("cnpj"))
+                    st = (p.get("status_venda") or "").upper().replace("Ã", "A")
+                    if c_dig:
+                        if "NAO" not in st and ("COMPROU" in st or "CONVERTIDO" in st):
+                            cnpjs_comprados.add(c_dig)
+                        elif "NAO" in st and "COMPROU" in st:
+                            cnpjs_nao_compraram.add(c_dig)
+
             for row in linhas:
                 cnpj = row[i_cnpj] if i_cnpj is not None and i_cnpj < len(row) else ""
                 nome = row[i_nome] if i_nome is not None and i_nome < len(row) else ""
@@ -972,84 +1100,116 @@ async def importar_planilha_mapeada(
                 telefone = row[i_tel] if i_tel is not None and i_tel < len(row) else ""
                 celular = row[i_cel] if i_cel is not None and i_cel < len(row) else ""
 
+                cnpj_dig = limpar_digitos(cnpj)
+                if cnpj_dig and cnpj_dig in cnpjs_comprados:
+                    ignorados_ja_comprou += 1
+                    continue
+
                 jid = normalizar_numero_wa(celular, telefone)
                 if not jid:
                     ignorados += 1
                     continue
 
+                status_inicial = "nao_comprou" if (cnpj_dig and cnpj_dig in cnpjs_nao_compraram) else "nao_enviado"
+
                 cur.execute("""
-                    INSERT INTO leads_crm (cnpj, nome, razao_social, telefone, celular, jid, status_lead, origem)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'NOVO', %s)
-                    ON DUPLICATE KEY UPDATE
-                        cnpj = IF(%s != '', %s, cnpj),
-                        nome = IF(%s != '', %s, nome),
-                        razao_social = IF(%s != '', %s, razao_social),
-                        telefone = IF(%s != '', %s, telefone),
-                        celular = IF(%s != '', %s, celular)
+                    INSERT INTO contatos_importados
+                        (cnpj, nome, razao_social, telefone, celular, jid, status_contato, origem)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (jid) DO UPDATE SET
+                        cnpj = CASE WHEN EXCLUDED.cnpj != '' THEN EXCLUDED.cnpj ELSE contatos_importados.cnpj END,
+                        nome = CASE WHEN EXCLUDED.nome != '' THEN EXCLUDED.nome ELSE contatos_importados.nome END,
+                        razao_social = CASE WHEN EXCLUDED.razao_social != '' THEN EXCLUDED.razao_social ELSE contatos_importados.razao_social END,
+                        telefone = CASE WHEN EXCLUDED.telefone != '' THEN EXCLUDED.telefone ELSE contatos_importados.telefone END,
+                        celular = CASE WHEN EXCLUDED.celular != '' THEN EXCLUDED.celular ELSE contatos_importados.celular END
                 """, (
-                    cnpj, nome, razao, telefone, celular, jid, arquivo.filename or "PLANILHA",
-                    cnpj, cnpj, nome, nome, razao, razao, telefone, telefone, celular, celular
+                    cnpj, nome, razao, telefone, celular, jid, status_inicial, arquivo.filename or "PLANILHA"
                 ))
                 importados += 1
     finally:
         conn.close()
 
-    return {"status": "ok", "importados": importados, "ignorados": ignorados, "total_lido": len(linhas)}
+    return {
+        "status": "ok",
+        "importados": importados,
+        "ignorados": ignorados,
+        "ignorados_ja_comprou": ignorados_ja_comprou,
+        "total_lido": len(linhas),
+    }
 
 
-@app.post("/api/admin/leads/excluir-massa")
-def excluir_leads_massa(dados: ExcluirMassaLeadsReq, request: Request):
+@app.put("/api/admin/contatos/{contato_id}/status")
+def atualizar_status_contato(contato_id: int, dados: AlterarStatusContatoReq, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
-    if not dados.ids:
-        raise HTTPException(status_code=400, detail="Nenhum lead selecionado para exclusão.")
+    status_valido = dados.status_contato.strip().lower()
+    if status_valido not in {"nao_enviado", "enviou", "falha", "nao_comprou"}:
+        raise HTTPException(status_code=400, detail="Status inválido.")
 
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            placeholders = ", ".join(["%s"] * len(dados.ids))
-            cur.execute(f"DELETE FROM leads_crm WHERE id IN ({placeholders})", tuple(dados.ids))
+            cur.execute(
+                "UPDATE contatos_importados SET status_contato = %s WHERE id = %s",
+                (status_valido, contato_id),
+            )
+        return {"status": "atualizado"}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/contatos/excluir-massa")
+def excluir_contatos_massa(dados: ExcluirMassaContatosReq, request: Request):
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+    if not dados.ids:
+        raise HTTPException(status_code=400, detail="Nenhum contato selecionado para exclusão.")
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM contatos_importados WHERE id = ANY(%s)", (dados.ids,))
             excluidos = cur.rowcount
         return {"status": "excluido", "total": excluidos}
     finally:
         conn.close()
 
 
-@app.delete("/api/admin/leads/{lead_id}")
-def excluir_lead(lead_id: int, request: Request):
+@app.delete("/api/admin/contatos/{contato_id}")
+def excluir_contato(contato_id: int, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM leads_crm WHERE id = %s", (lead_id,))
+            cur.execute("DELETE FROM contatos_importados WHERE id = %s", (contato_id,))
         return {"status": "excluido"}
     finally:
         conn.close()
 
 
-@app.post("/api/admin/leads/abrir-conversa")
-def abrir_conversa_lead(dados: IniciarChatLeadReq, request: Request):
+@app.post("/api/admin/contatos/abrir-conversa")
+def abrir_conversa_contato(dados: IniciarChatContatoReq, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM leads_crm WHERE id = %s", (dados.lead_id,))
-            lead = cur.fetchone()
-            if not lead:
-                raise HTTPException(status_code=404, detail="Lead não encontrado")
+            cur.execute("SELECT * FROM contatos_importados WHERE id = %s", (dados.contato_id,))
+            contato = cur.fetchone()
+            if not contato:
+                raise HTTPException(status_code=404, detail="Contato não encontrado")
 
-            nome_chat = lead["nome"] or lead["razao_social"] or lead["jid"].split("@")[0]
+            nome_chat = contato["nome"] or contato["razao_social"] or contato["jid"].split("@")[0]
             cur.execute("""
                 INSERT INTO atendimentos (jid, nome, setor, status, ultima_mensagem, atualizado_em)
-                VALUES (%s, %s, %s, 'EM_ATENDIMENTO', 'Conversa iniciada via CRM', NOW())
-                ON DUPLICATE KEY UPDATE
-                    setor = %s,
+                VALUES (%s, %s, %s, 'EM_ATENDIMENTO', 'Conversa iniciada via Contatos Importados', NOW())
+                ON CONFLICT (jid) DO UPDATE SET
+                    setor = EXCLUDED.setor,
                     status = 'EM_ATENDIMENTO',
                     atualizado_em = NOW()
-            """, (lead["jid"], nome_chat, dados.setor_destino, dados.setor_destino))
-            return {"status": "ok", "jid": lead["jid"]}
+            """, (contato["jid"], nome_chat, dados.setor_destino))
+            return {"status": "ok", "jid": contato["jid"]}
     finally:
         conn.close()
 
@@ -1075,10 +1235,10 @@ def criar_template(dados: TemplateReq, request: Request):
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO templates_disparo (titulo, conteudo) VALUES (%s, %s)",
+                "INSERT INTO templates_disparo (titulo, conteudo) VALUES (%s, %s) RETURNING id",
                 (dados.titulo.strip(), dados.conteudo.strip()),
             )
-            novo_id = cur.lastrowid
+            novo_id = cur.fetchone()["id"]
         return {"status": "criado", "id": novo_id}
     finally:
         conn.close()
@@ -1133,7 +1293,8 @@ def salvar_antiban(dados: AntiBanReq, request: Request):
                     limite_mensagens = %s,
                     janela_segundos = %s,
                     atraso_min_ms = %s,
-                    atraso_max_ms = %s
+                    atraso_max_ms = %s,
+                    atualizado_em = NOW()
                 WHERE id = 1
             """, (
                 1 if dados.habilitado else 0,
@@ -1148,17 +1309,17 @@ def salvar_antiban(dados: AntiBanReq, request: Request):
 
 
 async def executar_campanha_background(
-    leads: List[Dict[str, Any]],
+    contatos: List[Dict[str, Any]],
     template_texto: str,
     setor_destino: str,
     autor: str,
     enviar_ambos_numeros: bool = False,
 ):
     fila_envios = []
-    for lead in leads:
-        jids = extrair_jids_lead(lead, enviar_ambos=enviar_ambos_numeros)
+    for contato in contatos:
+        jids = extrair_jids_contato(contato, enviar_ambos=enviar_ambos_numeros)
         if jids:
-            fila_envios.append((lead, jids))
+            fila_envios.append((contato, jids))
 
     total_mensagens = sum(len(jids) for _, jids in fila_envios)
     CAMPANHA_STATUS["em_execucao"] = True
@@ -1167,15 +1328,15 @@ async def executar_campanha_background(
     CAMPANHA_STATUS["falhas"] = 0
 
     try:
-        for lead, jids in fila_envios:
-            nome_lead = lead.get("nome") or lead.get("razao_social") or jids[0].split("@")[0]
-            mensagem_final = aplicar_variaveis_template(template_texto, lead)
+        for contato, jids in fila_envios:
+            nome_contato = contato.get("nome") or contato.get("razao_social") or jids[0].split("@")[0]
+            mensagem_final = aplicar_variaveis_template(template_texto, contato)
             algum_sucesso = False
 
             for idx, jid in enumerate(jids):
                 tag_num = f" [{idx + 1}/{len(jids)}]" if len(jids) > 1 else ""
-                CAMPANHA_STATUS["atual"] = f"{nome_lead} ({jid.split('@')[0]}){tag_num}"
-                CAMPANHA_STATUS["mensagem_status"] = f"Enviando para {nome_lead} ({jid.split('@')[0]}){tag_num}..."
+                CAMPANHA_STATUS["atual"] = f"{nome_contato} ({jid.split('@')[0]}){tag_num}"
+                CAMPANHA_STATUS["mensagem_status"] = f"Enviando para {nome_contato} ({jid.split('@')[0]}){tag_num}..."
 
                 ok = await enviar_texto_wa(jid, mensagem_final)
                 if ok:
@@ -1185,7 +1346,7 @@ async def executar_campanha_background(
                         jid=jid,
                         remetente=f"CAMPANHA ({autor})",
                         conteudo=mensagem_final,
-                        nome=nome_lead,
+                        nome=nome_contato,
                         incrementar_nao_lidas=False,
                         tipo_midia="TEXT",
                         setor_padrao=setor_destino,
@@ -1199,13 +1360,13 @@ async def executar_campanha_background(
                 with conn.cursor() as cur:
                     if algum_sucesso:
                         cur.execute(
-                            "UPDATE leads_crm SET status_lead = 'CONTATADO', ultimo_disparo = NOW() WHERE id = %s",
-                            (lead["id"],),
+                            "UPDATE contatos_importados SET status_contato = 'enviou', ultimo_disparo = NOW() WHERE id = %s",
+                            (contato["id"],),
                         )
                     else:
                         cur.execute(
-                            "UPDATE leads_crm SET status_lead = 'FALHA_ENVIO' WHERE id = %s",
-                            (lead["id"],),
+                            "UPDATE contatos_importados SET status_contato = 'falha' WHERE id = %s",
+                            (contato["id"],),
                         )
             finally:
                 conn.close()
@@ -1225,7 +1386,7 @@ async def iniciar_disparo_massa(dados: DisparoMassaReq, request: Request, backgr
     if CAMPANHA_STATUS["em_execucao"]:
         raise HTTPException(status_code=400, detail="Já existe um disparo em massa em andamento.")
 
-    status_filtro = (dados.status_filtro or "NOVO").strip().upper()
+    status_filtro = (dados.status_filtro or "nao_enviado").strip().lower()
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -1234,36 +1395,35 @@ async def iniciar_disparo_massa(dados: DisparoMassaReq, request: Request, backgr
             if not tpl:
                 raise HTTPException(status_code=404, detail="Template de mensagem não encontrado.")
 
-            if status_filtro == "SELECIONADOS":
-                if not dados.lead_ids:
-                    raise HTTPException(status_code=400, detail="Marque pelo menos um lead no grid antes de disparar.")
-                placeholders = ", ".join(["%s"] * len(dados.lead_ids))
+            if status_filtro == "selecionados":
+                if not dados.contato_ids:
+                    raise HTTPException(status_code=400, detail="Marque pelo menos um contato no grid antes de disparar.")
                 cur.execute(
-                    f"SELECT * FROM leads_crm WHERE id IN ({placeholders}) ORDER BY id ASC",
-                    tuple(dados.lead_ids),
+                    "SELECT * FROM contatos_importados WHERE id = ANY(%s) ORDER BY id ASC",
+                    (dados.contato_ids,),
                 )
-            elif status_filtro == "TODOS":
-                cur.execute("SELECT * FROM leads_crm ORDER BY id ASC")
+            elif status_filtro == "todos":
+                cur.execute("SELECT * FROM contatos_importados ORDER BY id ASC")
             else:
-                cur.execute("SELECT * FROM leads_crm WHERE status_lead = %s ORDER BY id ASC", (status_filtro,))
-            leads = cur.fetchall()
+                cur.execute("SELECT * FROM contatos_importados WHERE status_contato = %s ORDER BY id ASC", (status_filtro,))
+            contatos = [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
-    if not leads:
-        raise HTTPException(status_code=400, detail=f"Nenhum lead encontrado para o filtro '{status_filtro}'.")
+    if not contatos:
+        raise HTTPException(status_code=400, detail=f"Nenhum contato encontrado para o filtro '{status_filtro}'.")
 
-    total_destinos = sum(len(extrair_jids_lead(l, dados.enviar_ambos_numeros)) for l in leads)
+    total_destinos = sum(len(extrair_jids_contato(c, dados.enviar_ambos_numeros)) for c in contatos)
 
     background_tasks.add_task(
         executar_campanha_background,
-        leads,
+        contatos,
         tpl["conteudo"],
         dados.setor_destino,
         user["nome"],
         dados.enviar_ambos_numeros,
     )
-    return {"status": "iniciado", "total": total_destinos, "leads": len(leads)}
+    return {"status": "iniciado", "total": total_destinos, "contatos": len(contatos)}
 
 
 @app.get("/api/admin/disparo-massa/status")
@@ -1276,7 +1436,7 @@ def status_disparo_massa(request: Request):
 # --- ROTAS DE ATENDIMENTO ---
 @app.get("/")
 async def health_check():
-    return {"status": "online", "service": "tottem-omnidesk-crm"}
+    return {"status": "online", "service": "tottem-omnidesk-supabase"}
 
 
 @app.post("/webhook/whatsapp")
@@ -1296,10 +1456,10 @@ def listar_chats(request: Request, filtro_setor: Optional[str] = None):
     try:
         with conn.cursor() as cur:
             base_sql = """
-                SELECT a.*, DATE_FORMAT(a.atualizado_em, '%%H:%%i') as hora_fmt,
-                       l.cnpj, l.razao_social, l.telefone AS lead_telefone, l.celular AS lead_celular
+                SELECT a.*, TO_CHAR(a.atualizado_em, 'HH24:MI') as hora_fmt,
+                       c.cnpj, c.razao_social, c.telefone AS contato_telefone, c.celular AS contato_celular
                 FROM atendimentos a
-                LEFT JOIN leads_crm l ON a.jid = l.jid
+                LEFT JOIN contatos_importados c ON a.jid = c.jid
             """
             if user["role"] == "ADMIN":
                 if filtro_setor and filtro_setor != "TODOS":
@@ -1332,7 +1492,7 @@ def listar_mensagens(jid: str, request: Request):
             cur.execute(
                 """
                 SELECT id, remetente, conteudo, tipo_midia, url_midia,
-                       DATE_FORMAT(criado_em, '%%H:%%i') as hora
+                       TO_CHAR(criado_em, 'HH24:MI') as hora
                 FROM mensagens_atendimento
                 WHERE jid = %s ORDER BY id ASC LIMIT 300
                 """,
@@ -1449,7 +1609,7 @@ async def encerrar_atendimento(dados: AcaoTicketReq, request: Request):
 
 
 # ==============================================================================
-# INTERFACE ENTERPRISE OMNICHANNEL + CRM + PREVIEW MAPEAMENTO (/painel)
+# INTERFACE ENTERPRISE OMNICHANNEL + CONTATOS IMPORTADOS (/painel)
 # ==============================================================================
 HTML_PAINEL = """
 <!DOCTYPE html>
@@ -1457,7 +1617,7 @@ HTML_PAINEL = """
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tottem OmniDesk — CRM & Atendimento</title>
+  <title>Tottem OmniDesk — Atendimento & Prospecção</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
@@ -1479,15 +1639,15 @@ HTML_PAINEL = """
       <div class="bg-gradient-to-br from-slate-900 via-slate-800 to-emerald-950 text-white p-10 flex flex-col justify-between">
         <div>
           <div class="inline-flex items-center gap-2 bg-emerald-500/20 border border-emerald-400/30 text-emerald-300 text-xs font-semibold px-3 py-1 rounded-full mb-6">
-            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span> Tottem OmniDesk CRM
+            <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span> Tottem OmniDesk
           </div>
           <h1 class="text-3xl font-bold tracking-tight leading-tight">Central de Atendimento & Prospecção</h1>
           <p class="text-slate-300 text-sm mt-4 leading-relaxed">
-            Gestão omnichannel por departamentos, CRM de leads B2B, disparos inteligentes com proteção anti-banimento e áudio nativo.
+            Gestão omnichannel por departamentos, gerenciamento de contatos importados, sincronização com cadastro de testes/vendas e disparos inteligentes.
           </p>
         </div>
         <div class="text-xs text-slate-400 border-t border-slate-700/80 pt-4">
-          Tottem Tecnologia • Plataforma Corporativa
+          Tottem Tecnologia • Conectado ao Supabase
         </div>
       </div>
 
@@ -1530,10 +1690,9 @@ HTML_PAINEL = """
         <button onclick="fecharModalPreview()" class="text-slate-400 hover:text-white text-xl font-bold px-2">&times;</button>
       </div>
 
-      <!-- SELETORES DE VÍNCULO DE COLUNA -->
       <div class="p-6 bg-slate-50 border-b border-slate-200">
         <div class="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
-          Vincule cada campo do CRM à coluna correspondente da sua planilha:
+          Vincule cada campo à coluna correspondente da sua planilha:
         </div>
         <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-4">
           <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
@@ -1559,10 +1718,9 @@ HTML_PAINEL = """
         </div>
       </div>
 
-      <!-- TABELA DE PREVIEW -->
       <div class="flex-1 overflow-auto p-6">
         <div class="text-xs font-semibold text-slate-600 mb-2">
-          Pré-visualização das primeiras linhas da planilha (confira se os dados correspondem às colunas vinculadas):
+          Pré-visualização das primeiras linhas da planilha:
         </div>
         <div class="border border-slate-200 rounded-xl overflow-x-auto">
           <table class="w-full text-left text-xs">
@@ -1572,17 +1730,16 @@ HTML_PAINEL = """
         </div>
       </div>
 
-      <!-- RODAPÉ DE CONFIRMAÇÃO -->
       <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between">
         <span class="text-xs text-slate-500">
-          * O sistema adicionará automaticamente o código do Brasil (<strong>55</strong>) e ignorará linhas sem telefone válido.
+          * Registros cujo CNPJ já esteja marcado como <strong>COMPROU</strong> na tabela <code>pessoas</code> serão ignorados automaticamente.
         </span>
         <div class="flex items-center gap-3">
           <button onclick="fecharModalPreview()" class="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 font-semibold text-xs hover:bg-slate-100">
             Cancelar
           </button>
           <button id="btnConfirmarImportacao" onclick="confirmarImportacaoMapeada()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-6 py-2.5 rounded-xl text-xs shadow-sm transition">
-            Confirmar e Importar Leads
+            Confirmar e Importar Contatos
           </button>
         </div>
       </div>
@@ -1602,7 +1759,7 @@ HTML_PAINEL = """
         <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
       </button>
 
-      <button onclick="mudarAba('crm')" id="railCrm" title="Leads CRM & Disparos em Massa"
+      <button onclick="mudarAba('contatos')" id="railContatos" title="Contatos Importados & Disparos em Massa"
               class="hidden w-11 h-11 rounded-xl flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-800 transition">
         <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
       </button>
@@ -1645,7 +1802,7 @@ HTML_PAINEL = """
       </div>
       <div class="flex items-center gap-4 text-xs text-slate-500">
         <span class="inline-flex items-center gap-1.5">
-          <span class="w-2 h-2 rounded-full bg-emerald-500"></span> WhatsApp Conectado
+          <span class="w-2 h-2 rounded-full bg-emerald-500"></span> Supabase + WhatsApp Conectados
         </span>
         <span id="nomeOperadorTop" class="font-semibold text-slate-700"></span>
       </div>
@@ -1675,7 +1832,7 @@ HTML_PAINEL = """
       <main class="flex-1 flex flex-col chat-bg relative">
         <div id="chatVazio" class="flex-1 flex flex-col items-center justify-center text-slate-400 bg-slate-50/90">
           <p class="text-sm font-medium text-slate-600">Nenhuma conversa selecionada</p>
-          <p class="text-xs text-slate-400 mt-1">Escolha um cliente na fila à esquerda ou inicie uma conversa pela aba CRM.</p>
+          <p class="text-xs text-slate-400 mt-1">Escolha um cliente na fila à esquerda ou inicie uma conversa pela aba Contatos Importados.</p>
         </div>
 
         <div id="chatAtivo" class="hidden flex-1 flex flex-col h-full">
@@ -1719,7 +1876,7 @@ HTML_PAINEL = """
 
       <aside id="painelDireito" class="hidden w-72 bg-white border-l border-slate-200 flex flex-col p-4 space-y-5 overflow-y-auto">
         <div id="blocoDadosEmpresa" class="hidden bg-emerald-50/60 border border-emerald-200/80 rounded-xl p-3 space-y-1.5">
-          <div class="text-[10px] font-bold uppercase tracking-wider text-emerald-700">Dados Cadastrais (CRM)</div>
+          <div class="text-[10px] font-bold uppercase tracking-wider text-emerald-700">Dados Cadastrais</div>
           <div class="text-xs font-bold text-slate-800" id="crmRazaoSocial"></div>
           <div class="text-[11px] font-mono text-slate-600" id="crmCnpj"></div>
         </div>
@@ -1745,7 +1902,7 @@ HTML_PAINEL = """
         </div>
 
         <div class="flex-1 flex flex-col">
-          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Anotações Internas (CRM)</h3>
+          <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Anotações Internas</h3>
           <textarea id="notasCrmInput" rows="5" placeholder="Registre observações sobre este cliente..."
                     class="w-full border border-slate-200 rounded-xl p-2.5 text-xs focus:outline-none focus:border-emerald-500 bg-slate-50"></textarea>
           <button onclick="salvarNotas()" class="mt-2 bg-slate-800 hover:bg-slate-900 text-white text-xs font-semibold py-2 rounded-lg transition">
@@ -1756,9 +1913,9 @@ HTML_PAINEL = """
     </div>
 
     <!-- =================================================================== -->
-    <!-- ABA 2: CRM DE LEADS, PREVIEW/MAPEAMENTO E DISPARO EM MASSA          -->
+    <!-- ABA 2: CONTATOS IMPORTADOS, SINCRONIZAÇÃO PESSOAS E DISPAROS        -->
     <!-- =================================================================== -->
-    <div id="abaCrm" class="hidden flex-1 overflow-y-auto p-6">
+    <div id="abaContatos" class="hidden flex-1 overflow-y-auto p-6">
       <div class="max-w-7xl mx-auto space-y-6">
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -1766,14 +1923,14 @@ HTML_PAINEL = """
           <!-- CARD 1: IMPORTAR PLANILHA COM PREVIEW -->
           <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col justify-between">
             <div>
-              <span class="text-[11px] font-bold uppercase tracking-wider text-emerald-600">Passo 1 • Base de Leads</span>
+              <span class="text-[11px] font-bold uppercase tracking-wider text-emerald-600">Passo 1 • Contatos Importados</span>
               <h3 class="text-base font-bold text-slate-800 mt-1">Importar Planilha de Contatos</h3>
               <p class="text-xs text-slate-500 mt-1 leading-relaxed">
-                Selecione uma planilha <strong>.xlsx</strong> ou <strong>.csv</strong> para visualizar os dados e vincular cada coluna ao campo do CRM.
+                Importe <strong>.xlsx</strong> ou <strong>.csv</strong> para a tabela <code>contatos_importados</code> (sem tocar em <code>clientes</code> ou <code>pessoas</code>).
               </p>
             </div>
             <div class="mt-4 space-y-3">
-              <input type="file" id="inputPlanilhaLeads" accept=".xlsx,.xlsm,.csv,.txt"
+              <input type="file" id="inputPlanilhaContatos" accept=".xlsx,.xlsm,.csv,.txt"
                      onchange="abrirPreviewPlanilha()"
                      class="block w-full text-xs text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-emerald-50 file:text-emerald-700 hover:file:bg-emerald-100 cursor-pointer" />
               <button onclick="abrirPreviewPlanilha()" class="w-full bg-slate-900 hover:bg-slate-800 text-white font-semibold py-2.5 rounded-xl text-xs transition">
@@ -1831,14 +1988,14 @@ HTML_PAINEL = """
                   <select id="selectSetorDisparo" class="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs bg-white"></select>
                 </div>
                 <div>
-                  <label class="block text-[11px] font-semibold text-slate-600 mb-1">Público / Status dos Leads para Envio</label>
+                  <label class="block text-[11px] font-semibold text-slate-600 mb-1">Público / Status dos Contatos para Envio</label>
                   <select id="selectStatusDisparo" class="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs bg-white font-medium text-slate-700">
-                    <option value="SELECIONADOS" id="optStatusSelecionados">SELECIONADOS (0 marcados no grid)</option>
-                    <option value="NOVO" selected>NOVO (Apenas não contatados)</option>
-                    <option value="CONTATADO">CONTATADO (Reengajamento / Follow-up)</option>
-                    <option value="EM_ATENDIMENTO">EM_ATENDIMENTO</option>
-                    <option value="FALHA_ENVIO">FALHA_ENVIO (Tentar novamente)</option>
-                    <option value="TODOS">TODOS OS LEADS DA BASE</option>
+                    <option value="selecionados" id="optStatusSelecionados">selecionados (0 marcados no grid)</option>
+                    <option value="nao_enviado" selected>nao_enviado (Apenas não contatados)</option>
+                    <option value="nao_comprou">nao_comprou (Repescagem pós-teste)</option>
+                    <option value="enviou">enviou (Follow-up)</option>
+                    <option value="falha">falha (Tentar novamente)</option>
+                    <option value="todos">todos (Toda a lista importada)</option>
                   </select>
                 </div>
                 <label class="flex items-center gap-2 text-xs text-slate-700 pt-1 cursor-pointer">
@@ -1856,37 +2013,61 @@ HTML_PAINEL = """
           </div>
         </div>
 
-        <!-- TABELA DE LEADS CRM -->
+        <!-- TABELA DE CONTATOS IMPORTADOS + BOTÃO SINCRONIZAR PESSOAS -->
         <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
           <div class="px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h3 class="text-sm font-bold text-slate-800">Base de Leads Cadastrados (CRM)</h3>
-              <p class="text-xs text-slate-500">Total de empresas/contatos exibidos: <strong id="totalLeadsBadge">0</strong></p>
+              <h3 class="text-sm font-bold text-slate-800">Contatos Importados para Prospecção</h3>
+              <p class="text-xs text-slate-500">
+                Exibindo: <strong id="totalContatosBadge">0</strong> contatos •
+                <span class="text-slate-400">Registros marcados como <strong>COMPROU</strong> na tabela <code>pessoas</code> são removidos ao sincronizar.</span>
+              </p>
             </div>
-            <div class="flex items-center gap-3">
-              <button id="btnExcluirMassaLeads" onclick="excluirLeadsEmMassa()" class="hidden bg-rose-600 hover:bg-rose-700 text-white font-semibold px-3.5 py-2 rounded-xl text-xs shadow-sm transition">
-                Excluir Selecionados (<span id="qtdLeadsSelecionados">0</span>)
+            <div class="flex flex-wrap items-center gap-2.5">
+              <button id="btnSincronizarPessoas" onclick="sincronizarComTabelaPessoas()"
+                      class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-4 py-2 rounded-xl text-xs shadow-sm transition inline-flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                <span>Sincronizar com Tabela Pessoas</span>
               </button>
-              <input id="buscaLeadsCrm" oninput="renderizarTabelaLeads()" type="text" placeholder="Filtrar por CNPJ, Razão Social, Nome, Status ou Telefone..."
-                     class="w-80 border border-slate-300 rounded-xl px-3.5 py-2 text-xs focus:outline-none focus:border-emerald-500" />
+
+              <button id="btnExcluirMassaContatos" onclick="excluirContatosEmMassa()" class="hidden bg-rose-600 hover:bg-rose-700 text-white font-semibold px-3.5 py-2 rounded-xl text-xs shadow-sm transition">
+                Excluir Selecionados (<span id="qtdContatosSelecionados">0</span>)
+              </button>
+
+              <select id="filtroStatusTabela" onchange="renderizarTabelaContatos()" class="border border-slate-300 rounded-xl px-3 py-2 text-xs bg-slate-50 font-medium text-slate-700">
+                <option value="TODOS">Status: Todos</option>
+                <option value="nao_enviado">nao_enviado</option>
+                <option value="enviou">enviou</option>
+                <option value="falha">falha</option>
+                <option value="nao_comprou">nao_comprou</option>
+              </select>
+
+              <input id="buscaContatos" oninput="renderizarTabelaContatos()" type="text" placeholder="Filtrar CNPJ, Razão Social, Nome ou Telefone..."
+                     class="w-72 border border-slate-300 rounded-xl px-3.5 py-2 text-xs focus:outline-none focus:border-emerald-500" />
             </div>
           </div>
+
+          <div id="bannerSincronizacao" class="hidden px-6 py-3 bg-indigo-50 border-b border-indigo-200 text-indigo-900 text-xs flex items-center justify-between">
+            <span id="textoSincronizacao"></span>
+            <button onclick="document.getElementById('bannerSincronizacao').classList.add('hidden')" class="font-bold text-indigo-600 hover:text-indigo-900">&times;</button>
+          </div>
+
           <div class="overflow-x-auto">
             <table class="w-full text-left text-xs">
               <thead class="bg-slate-50 border-b border-slate-200 uppercase text-slate-500 font-semibold">
                 <tr>
                   <th class="px-4 py-3 w-10">
-                    <input type="checkbox" id="chkSelecionarTodosLeads" onclick="alternarSelecionarTodosLeads(this)" class="rounded text-emerald-600 cursor-pointer" title="Selecionar todos visíveis" />
+                    <input type="checkbox" id="chkSelecionarTodosContatos" onclick="alternarSelecionarTodosContatos(this)" class="rounded text-emerald-600 cursor-pointer" title="Selecionar todos visíveis" />
                   </th>
                   <th class="px-4 py-3">CNPJ</th>
                   <th class="px-4 py-3">Razão Social</th>
                   <th class="px-4 py-3">Contato / Nome</th>
                   <th class="px-4 py-3">Celular / Telefone</th>
-                  <th class="px-4 py-3">Status CRM</th>
+                  <th class="px-4 py-3">Status</th>
                   <th class="px-4 py-3 text-right">Ações</th>
                 </tr>
               </thead>
-              <tbody id="tabelaLeadsBody" class="divide-y divide-slate-100"></tbody>
+              <tbody id="tabelaContatosBody" class="divide-y divide-slate-100"></tbody>
             </table>
           </div>
         </div>
@@ -1904,7 +2085,7 @@ HTML_PAINEL = """
             <h2 class="text-xl font-bold text-slate-900">Proteção Anti-Banimento (Beta)</h2>
           </div>
           <p class="text-sm text-slate-600 mt-2 leading-relaxed">
-            Evite que o seu número do WhatsApp seja detectado como spam ou banido adicionando atrasos aleatórios inteligentes entre as mensagens enviadas. Isso se aplica a todas as ações: respostas do bot, respostas automáticas, transmissões, mensagens agendadas e chamadas de API para esta sessão.
+            Evite que o seu número do WhatsApp seja detectado como spam ou banido adicionando atrasos aleatórios inteligentes entre as mensagens enviadas.
           </p>
         </div>
 
@@ -1912,7 +2093,7 @@ HTML_PAINEL = """
           <div class="flex-1 text-center">
             <h3 class="text-sm font-bold text-orange-700">Habilitar atraso anti-spam</h3>
             <p class="text-xs text-slate-600 mt-1">
-              Quando ativado, as mensagens serão enfileiradas e enviadas com um atraso aleatório se o limite de taxa for atingido. As mensagens nunca são rejeitadas — apenas atrasadas.
+              Quando ativado, as mensagens serão enfileiradas e enviadas com um atraso aleatório se o limite de taxa for atingido.
             </p>
           </div>
           <label class="relative inline-flex items-center cursor-pointer shrink-0">
@@ -1921,59 +2102,35 @@ HTML_PAINEL = """
           </label>
         </div>
 
-        <div class="bg-sky-50/70 border border-sky-200/80 rounded-2xl p-5">
-          <div class="flex items-center gap-2 text-sm font-bold text-slate-800">
-            <span>💡</span>
-            <span>Como funciona</span>
-          </div>
-          <p class="text-xs text-slate-700 mt-2 leading-relaxed">
-            O sistema monitora quantas mensagens esta sessão envia dentro de uma janela de tempo. Se o número de mensagens exceder o limite dentro da janela de tempo, cada mensagem subsequente será atrasada por um valor aleatório entre o atraso mínimo e máximo. Assim que a janela de tempo é reiniciada, as mensagens voltam à velocidade normal.
-          </p>
-        </div>
-
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
           <div>
             <label class="block text-sm font-bold text-slate-800 mb-1.5">Limite de mensagens</label>
             <input id="abLimite" type="number" min="1" value="5"
                    class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-600" />
-            <p class="text-xs text-slate-500 mt-1.5">
-              Número de mensagens permitidas na velocidade máxima antes do início do atraso. <span class="text-orange-600 font-medium">Menor = mais seguro, porém mais lento.</span>
-            </p>
           </div>
 
           <div>
             <label class="block text-sm font-bold text-slate-800 mb-1.5">Janela de tempo (segundos)</label>
             <input id="abJanela" type="number" min="1" value="10"
                    class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-600" />
-            <p class="text-xs text-slate-500 mt-1.5">
-              A janela contínua para contar mensagens. Após esse tempo, o contador é reiniciado naturalmente. <span class="text-orange-600 font-medium">Mais longo = mais conservador.</span>
-            </p>
           </div>
 
           <div>
             <label class="block text-sm font-bold text-slate-800 mb-1.5">Atraso Mínimo (ms)</label>
             <input id="abMinMs" type="number" min="0" step="100" value="1000"
                    class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-600" />
-            <p class="text-xs text-slate-500 mt-1.5">Atraso aleatório mínimo aplicado. 1000ms = 1 segundo.</p>
           </div>
 
           <div>
             <label class="block text-sm font-bold text-slate-800 mb-1.5">Atraso Máximo (ms)</label>
             <input id="abMaxMs" type="number" min="0" step="100" value="3000"
                    class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-600" />
-            <p class="text-xs text-slate-500 mt-1.5">Atraso aleatório máximo aplicado. 3000ms = 3 segundos.</p>
           </div>
         </div>
 
-        <div class="bg-amber-50/80 border border-amber-200 rounded-xl px-4 py-3 text-xs text-slate-700 flex items-center gap-2">
-          <span>⚠️</span>
-          <span>Configurações seguras recomendadas: Limite 5, Janela 10s, Atraso 1000–3000ms. Para transmissões de grande volume, use Limite 3 com Atraso 2000–5000ms.</span>
-        </div>
-
         <div class="flex items-center gap-4">
-          <button onclick="salvarConfigAntiBan()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-6 py-3 rounded-xl text-sm shadow-sm transition inline-flex items-center gap-2">
-            <span>💾</span>
-            <span>Salvar configurações de proteção</span>
+          <button onclick="salvarConfigAntiBan()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-6 py-3 rounded-xl text-sm shadow-sm transition">
+            Salvar configurações de proteção
           </button>
           <span id="msgSalvoAntiban" class="hidden text-xs font-semibold text-emerald-700">Configurações salvas com sucesso!</span>
         </div>
@@ -2056,8 +2213,8 @@ HTML_PAINEL = """
     let USUARIO = JSON.parse(localStorage.getItem("tottem_user") || "null");
     let PERFIS = [];
     let CHATS_CACHE = [];
-    let LEADS_CACHE = [];
-    let LEADS_SELECIONADOS = new Set();
+    let CONTATOS_CACHE = [];
+    let CONTATOS_SELECIONADOS = new Set();
     let TEMPLATES_CACHE = [];
     let PREVIEW_DATA = null;
     let JID_ATUAL = null;
@@ -2113,7 +2270,7 @@ HTML_PAINEL = """
       document.getElementById("avatarOperador").innerText = iniciais(USUARIO.nome);
 
       if (USUARIO.role === "ADMIN") {
-        ["railCrm", "railAntiban", "railPerfis", "railUsuarios", "filtroAdminSetor"].forEach(id => {
+        ["railContatos", "railAntiban", "railPerfis", "railUsuarios", "filtroAdminSetor"].forEach(id => {
           document.getElementById(id).classList.remove("hidden");
         });
       }
@@ -2129,8 +2286,8 @@ HTML_PAINEL = """
     }
 
     function mudarAba(aba) {
-      ["abaAtendimento", "abaCrm", "abaAntiban", "abaPerfis", "abaUsuarios"].forEach(id => document.getElementById(id).classList.add("hidden"));
-      ["railAtendimento", "railCrm", "railAntiban", "railPerfis", "railUsuarios"].forEach(id => {
+      ["abaAtendimento", "abaContatos", "abaAntiban", "abaPerfis", "abaUsuarios"].forEach(id => document.getElementById(id).classList.add("hidden"));
+      ["railAtendimento", "railContatos", "railAntiban", "railPerfis", "railUsuarios"].forEach(id => {
         const el = document.getElementById(id);
         el.classList.remove("bg-slate-800", "text-white");
         el.classList.add("text-slate-400");
@@ -2138,7 +2295,7 @@ HTML_PAINEL = """
 
       const mapa = {
         atendimento: ["abaAtendimento", "railAtendimento", "Atendimentos"],
-        crm: ["abaCrm", "railCrm", "CRM de Leads & Disparos em Massa"],
+        contatos: ["abaContatos", "railContatos", "Contatos Importados & Disparos em Massa"],
         antiban: ["abaAntiban", "railAntiban", "Proteção Anti-Banimento"],
         perfis: ["abaPerfis", "railPerfis", "Perfis & Departamentos"],
         usuarios: ["abaUsuarios", "railUsuarios", "Equipe & Vínculos"],
@@ -2148,8 +2305,8 @@ HTML_PAINEL = """
       document.getElementById(railId).classList.add("bg-slate-800", "text-white");
       document.getElementById("tituloPagina").innerText = titulo;
 
-      if (aba === "crm") {
-        carregarLeads();
+      if (aba === "contatos") {
+        carregarContatos();
         carregarTemplates();
       } else if (aba === "antiban") {
         carregarConfigAntiBan();
@@ -2261,6 +2418,33 @@ HTML_PAINEL = """
       carregarUsuarios();
     }
 
+    // --- SINCRONIZAÇÃO COM TABELA PESSOAS ---
+    async function sincronizarComTabelaPessoas() {
+      const btn = document.getElementById("btnSincronizarPessoas");
+      btn.disabled = true;
+      btn.classList.add("opacity-60");
+
+      try {
+        const res = await fetch("/api/admin/contatos/sincronizar-pessoas", {
+          method: "POST",
+          headers: authHeaders()
+        });
+        const data = await res.json();
+        if (res.ok) {
+          const banner = document.getElementById("bannerSincronizacao");
+          document.getElementById("textoSincronizacao").innerHTML =
+            `✅ Sincronização com <code>pessoas</code> concluída: <strong>${data.removidos_comprou}</strong> removido(s) por status <strong>COMPROU</strong> • <strong>${data.marcados_nao_comprou}</strong> atualizado(s) e <strong>${data.novos_nao_comprou}</strong> importado(s) como <strong>nao_comprou</strong>.`;
+          banner.classList.remove("hidden");
+          await carregarContatos();
+        } else {
+          alert(data.detail || "Erro ao sincronizar com a tabela pessoas.");
+        }
+      } finally {
+        btn.disabled = false;
+        btn.classList.remove("opacity-60");
+      }
+    }
+
     // --- PREVIEW E MAPEAMENTO DE PLANILHA ---
     function autoDetectarColuna(colunas, palavrasChave) {
       for (let i = 0; i < colunas.length; i++) {
@@ -2273,14 +2457,14 @@ HTML_PAINEL = """
     }
 
     async function abrirPreviewPlanilha() {
-      const input = document.getElementById("inputPlanilhaLeads");
+      const input = document.getElementById("inputPlanilhaContatos");
       if (!input.files.length) return alert("Selecione uma planilha .xlsx ou .csv primeiro.");
 
       const formData = new FormData();
       formData.append("arquivo", input.files[0]);
 
       try {
-        const res = await fetch("/api/admin/leads/preview", {
+        const res = await fetch("/api/admin/contatos/preview", {
           method: "POST",
           headers: authHeaders(false),
           body: formData
@@ -2350,7 +2534,7 @@ HTML_PAINEL = """
     }
 
     async function confirmarImportacaoMapeada() {
-      const input = document.getElementById("inputPlanilhaLeads");
+      const input = document.getElementById("inputPlanilhaContatos");
       if (!input.files.length) return;
 
       const colCel = document.getElementById("mapColCelular").value;
@@ -2372,7 +2556,7 @@ HTML_PAINEL = """
       formData.append("col_telefone", colTel);
 
       try {
-        const res = await fetch("/api/admin/leads/importar-mapeado", {
+        const res = await fetch("/api/admin/contatos/importar-mapeado", {
           method: "POST",
           headers: authHeaders(false),
           body: formData
@@ -2382,137 +2566,165 @@ HTML_PAINEL = """
           fecharModalPreview();
           input.value = "";
           const resumo = document.getElementById("resumoImportacao");
-          resumo.innerHTML = `✅ Importação concluída! <strong>${data.importados}</strong> leads gravados no CRM (${data.ignorados} linhas sem telefone válido ignoradas).`;
+          resumo.innerHTML = `✅ Importação concluída! <strong>${data.importados}</strong> gravados (${data.ignorados_ja_comprou} já compraram, ${data.ignorados} sem telefone válido).`;
           resumo.classList.remove("hidden");
-          await carregarLeads();
+          await carregarContatos();
         } else {
           alert(data.detail || "Erro ao importar os dados.");
         }
       } finally {
         btn.disabled = false;
-        btn.innerText = "Confirmar e Importar Leads";
+        btn.innerText = "Confirmar e Importar Contatos";
       }
     }
 
-    // --- CRM LEADS, TEMPLATES E DISPARO ---
-    async function carregarLeads() {
-      const res = await fetch("/api/admin/leads", { headers: authHeaders() });
+    // --- CONTATOS IMPORTADOS, TEMPLATES E DISPARO ---
+    async function carregarContatos() {
+      const res = await fetch("/api/admin/contatos", { headers: authHeaders() });
       if (!res.ok) return;
-      LEADS_CACHE = await res.json();
-      const idsValidos = new Set(LEADS_CACHE.map(l => l.id));
-      LEADS_SELECIONADOS = new Set([...LEADS_SELECIONADOS].filter(id => idsValidos.has(id)));
-      renderizarTabelaLeads();
+      CONTATOS_CACHE = await res.json();
+      const idsValidos = new Set(CONTATOS_CACHE.map(c => c.id));
+      CONTATOS_SELECIONADOS = new Set([...CONTATOS_SELECIONADOS].filter(id => idsValidos.has(id)));
+      renderizarTabelaContatos();
     }
 
-    function obterLeadsFiltrados() {
-      const termo = (document.getElementById("buscaLeadsCrm").value || "").toLowerCase();
-      return LEADS_CACHE.filter(l =>
-        (l.cnpj || "").toLowerCase().includes(termo) ||
-        (l.razao_social || "").toLowerCase().includes(termo) ||
-        (l.nome || "").toLowerCase().includes(termo) ||
-        (l.status_lead || "").toLowerCase().includes(termo) ||
-        (l.celular || "").includes(termo) ||
-        (l.telefone || "").includes(termo)
-      );
+    function obterContatosFiltrados() {
+      const termo = (document.getElementById("buscaContatos").value || "").toLowerCase();
+      const statusFiltro = document.getElementById("filtroStatusTabela").value;
+      return CONTATOS_CACHE.filter(c => {
+        const bateStatus = statusFiltro === "TODOS" || (c.status_contato || "") === statusFiltro;
+        const bateTexto =
+          (c.cnpj || "").toLowerCase().includes(termo) ||
+          (c.razao_social || "").toLowerCase().includes(termo) ||
+          (c.nome || "").toLowerCase().includes(termo) ||
+          (c.status_contato || "").toLowerCase().includes(termo) ||
+          (c.celular || "").includes(termo) ||
+          (c.telefone || "").includes(termo);
+        return bateStatus && bateTexto;
+      });
     }
 
     function atualizarBarraExclusaoMassa(filtrados) {
-      const btnMassa = document.getElementById("btnExcluirMassaLeads");
-      const spanQtd = document.getElementById("qtdLeadsSelecionados");
-      const chkTodos = document.getElementById("chkSelecionarTodosLeads");
+      const btnMassa = document.getElementById("btnExcluirMassaContatos");
+      const spanQtd = document.getElementById("qtdContatosSelecionados");
+      const chkTodos = document.getElementById("chkSelecionarTodosContatos");
       const optSel = document.getElementById("optStatusSelecionados");
 
-      spanQtd.innerText = LEADS_SELECIONADOS.size;
+      spanQtd.innerText = CONTATOS_SELECIONADOS.size;
       if (optSel) {
-        optSel.innerText = `SELECIONADOS (${LEADS_SELECIONADOS.size} marcados no grid)`;
+        optSel.innerText = `selecionados (${CONTATOS_SELECIONADOS.size} marcados no grid)`;
       }
-      if (LEADS_SELECIONADOS.size > 0) {
+      if (CONTATOS_SELECIONADOS.size > 0) {
         btnMassa.classList.remove("hidden");
       } else {
         btnMassa.classList.add("hidden");
       }
 
-      if (filtrados.length > 0 && filtrados.every(l => LEADS_SELECIONADOS.has(l.id))) {
+      if (filtrados.length > 0 && filtrados.every(c => CONTATOS_SELECIONADOS.has(c.id))) {
         chkTodos.checked = true;
       } else {
         chkTodos.checked = false;
       }
     }
 
-    function alternarSelecaoLead(id, checked) {
-      if (checked) LEADS_SELECIONADOS.add(id);
-      else LEADS_SELECIONADOS.delete(id);
-      atualizarBarraExclusaoMassa(obterLeadsFiltrados());
+    function alternarSelecaoContato(id, checked) {
+      if (checked) CONTATOS_SELECIONADOS.add(id);
+      else CONTATOS_SELECIONADOS.delete(id);
+      atualizarBarraExclusaoMassa(obterContatosFiltrados());
     }
 
-    function alternarSelecionarTodosLeads(checkbox) {
-      const filtrados = obterLeadsFiltrados();
+    function alternarSelecionarTodosContatos(checkbox) {
+      const filtrados = obterContatosFiltrados();
       if (checkbox.checked) {
-        filtrados.forEach(l => LEADS_SELECIONADOS.add(l.id));
+        filtrados.forEach(c => CONTATOS_SELECIONADOS.add(c.id));
       } else {
-        filtrados.forEach(l => LEADS_SELECIONADOS.delete(l.id));
+        filtrados.forEach(c => CONTATOS_SELECIONADOS.delete(c.id));
       }
-      renderizarTabelaLeads();
+      renderizarTabelaContatos();
     }
 
-    async function excluirLeadsEmMassa() {
-      const ids = Array.from(LEADS_SELECIONADOS);
+    async function excluirContatosEmMassa() {
+      const ids = Array.from(CONTATOS_SELECIONADOS);
       if (!ids.length) return;
-      if (!confirm(`Deseja realmente excluir ${ids.length} lead(s) selecionado(s) permanentemente?`)) return;
+      if (!confirm(`Deseja realmente excluir ${ids.length} contato(s) selecionado(s)?`)) return;
 
-      const res = await fetch("/api/admin/leads/excluir-massa", {
+      const res = await fetch("/api/admin/contatos/excluir-massa", {
         method: "POST",
         headers: authHeaders(),
         body: JSON.stringify({ ids })
       });
       if (res.ok) {
-        LEADS_SELECIONADOS.clear();
-        await carregarLeads();
+        CONTATOS_SELECIONADOS.clear();
+        await carregarContatos();
       } else {
         const err = await res.json().catch(() => ({}));
-        alert(err.detail || "Erro ao excluir leads em massa.");
+        alert(err.detail || "Erro ao excluir contatos em massa.");
       }
     }
 
-    function renderizarTabelaLeads() {
-      const filtrados = obterLeadsFiltrados();
-      document.getElementById("totalLeadsBadge").innerText = filtrados.length;
+    async function alterarStatusContato(id, novoStatus) {
+      const res = await fetch(`/api/admin/contatos/${id}/status`, {
+        method: "PUT",
+        headers: authHeaders(),
+        body: JSON.stringify({ status_contato: novoStatus })
+      });
+      if (res.ok) {
+        const item = CONTATOS_CACHE.find(c => c.id === id);
+        if (item) item.status_contato = novoStatus;
+        renderizarTabelaContatos();
+      }
+    }
+
+    function renderizarTabelaContatos() {
+      const filtrados = obterContatosFiltrados();
+      document.getElementById("totalContatosBadge").innerText = filtrados.length;
       atualizarBarraExclusaoMassa(filtrados);
 
       const corStatus = {
-        NOVO: "bg-sky-100 text-sky-800",
-        CONTATADO: "bg-amber-100 text-amber-800",
-        EM_ATENDIMENTO: "bg-emerald-100 text-emerald-800",
-        FALHA_ENVIO: "bg-rose-100 text-rose-800",
+        nao_enviado: "bg-sky-100 text-sky-800 border-sky-200",
+        enviou: "bg-emerald-100 text-emerald-800 border-emerald-200",
+        falha: "bg-rose-100 text-rose-800 border-rose-200",
+        nao_comprou: "bg-amber-100 text-amber-800 border-amber-200",
       };
 
-      document.getElementById("tabelaLeadsBody").innerHTML = filtrados.map(l => `
-        <tr class="hover:bg-slate-50 ${LEADS_SELECIONADOS.has(l.id) ? 'bg-rose-50/40' : ''}">
-          <td class="px-4 py-3">
-            <input type="checkbox" ${LEADS_SELECIONADOS.has(l.id) ? 'checked' : ''}
-                   onchange="alternarSelecaoLead(${l.id}, this.checked)"
-                   class="rounded text-emerald-600 cursor-pointer" />
-          </td>
-          <td class="px-4 py-3 font-mono text-slate-600">${l.cnpj || '-'}</td>
-          <td class="px-4 py-3 font-semibold text-slate-800">${l.razao_social || '-'}</td>
-          <td class="px-4 py-3 text-slate-700">${l.nome || '-'}</td>
-          <td class="px-4 py-3 font-mono text-slate-700">${[l.celular, l.telefone].filter(Boolean).join(" / ") || '-'}</td>
-          <td class="px-4 py-3"><span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold ${corStatus[l.status_lead] || 'bg-slate-100 text-slate-700'}">${l.status_lead}</span></td>
-          <td class="px-4 py-3 text-right space-x-2">
-            <button onclick="abrirConversaDoLead(${l.id})" class="bg-emerald-50 hover:bg-emerald-600 text-emerald-700 hover:text-white border border-emerald-200 px-2.5 py-1 rounded-lg font-semibold transition">
-              Abrir Chat
-            </button>
-            <button onclick="excluirLead(${l.id})" class="text-rose-600 hover:underline">Excluir</button>
-          </td>
-        </tr>
-      `).join("");
+      document.getElementById("tabelaContatosBody").innerHTML = filtrados.map(c => {
+        const st = c.status_contato || "nao_enviado";
+        return `
+          <tr class="hover:bg-slate-50 ${CONTATOS_SELECIONADOS.has(c.id) ? 'bg-rose-50/40' : ''}">
+            <td class="px-4 py-3">
+              <input type="checkbox" ${CONTATOS_SELECIONADOS.has(c.id) ? 'checked' : ''}
+                     onchange="alternarSelecaoContato(${c.id}, this.checked)"
+                     class="rounded text-emerald-600 cursor-pointer" />
+            </td>
+            <td class="px-4 py-3 font-mono text-slate-600">${c.cnpj || '-'}</td>
+            <td class="px-4 py-3 font-semibold text-slate-800">${c.razao_social || '-'}</td>
+            <td class="px-4 py-3 text-slate-700">${c.nome || '-'}</td>
+            <td class="px-4 py-3 font-mono text-slate-700">${[c.celular, c.telefone].filter(Boolean).join(" / ") || '-'}</td>
+            <td class="px-4 py-3">
+              <select onchange="alterarStatusContato(${c.id}, this.value)"
+                      class="px-2 py-1 rounded-full text-[11px] font-bold border cursor-pointer ${corStatus[st] || 'bg-slate-100 text-slate-700 border-slate-200'}">
+                <option value="nao_enviado" ${st === 'nao_enviado' ? 'selected' : ''}>nao_enviado</option>
+                <option value="enviou" ${st === 'enviou' ? 'selected' : ''}>enviou</option>
+                <option value="falha" ${st === 'falha' ? 'selected' : ''}>falha</option>
+                <option value="nao_comprou" ${st === 'nao_comprou' ? 'selected' : ''}>nao_comprou</option>
+              </select>
+            </td>
+            <td class="px-4 py-3 text-right space-x-2">
+              <button onclick="abrirConversaDoContato(${c.id})" class="bg-emerald-50 hover:bg-emerald-600 text-emerald-700 hover:text-white border border-emerald-200 px-2.5 py-1 rounded-lg font-semibold transition">
+                Abrir Chat
+              </button>
+              <button onclick="excluirContato(${c.id})" class="text-rose-600 hover:underline">Excluir</button>
+            </td>
+          </tr>
+        `;
+      }).join("");
     }
 
-    async function abrirConversaDoLead(leadId) {
+    async function abrirConversaDoContato(contatoId) {
       const setor = document.getElementById("selectSetorDisparo").value || "COMERCIAL";
-      const res = await fetch("/api/admin/leads/abrir-conversa", {
+      const res = await fetch("/api/admin/contatos/abrir-conversa", {
         method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ lead_id: leadId, setor_destino: setor })
+        body: JSON.stringify({ contato_id: contatoId, setor_destino: setor })
       });
       if (res.ok) {
         const data = await res.json();
@@ -2522,11 +2734,11 @@ HTML_PAINEL = """
       }
     }
 
-    async function excluirLead(id) {
-      if (!confirm("Remover este lead do CRM?")) return;
-      await fetch(`/api/admin/leads/${id}`, { method: "DELETE", headers: authHeaders() });
-      LEADS_SELECIONADOS.delete(id);
-      carregarLeads();
+    async function excluirContato(id) {
+      if (!confirm("Remover este contato da lista importada?")) return;
+      await fetch(`/api/admin/contatos/${id}`, { method: "DELETE", headers: authHeaders() });
+      CONTATOS_SELECIONADOS.delete(id);
+      carregarContatos();
     }
 
     async function carregarTemplates(idSelecionado = null) {
@@ -2618,22 +2830,22 @@ HTML_PAINEL = """
       const setor_destino = document.getElementById("selectSetorDisparo").value;
       const status_filtro = document.getElementById("selectStatusDisparo").value;
       const enviar_ambos_numeros = document.getElementById("chkEnviarAmbosNumeros").checked;
-      const lead_ids = Array.from(LEADS_SELECIONADOS);
+      const contato_ids = Array.from(CONTATOS_SELECIONADOS);
 
       if (!template_id) return alert("Cadastre ou selecione uma mensagem primeiro.");
-      if (status_filtro === "SELECIONADOS" && lead_ids.length === 0) {
-        return alert("Marque pelo menos um lead na tabela abaixo antes de iniciar o envio.");
+      if (status_filtro === "selecionados" && contato_ids.length === 0) {
+        return alert("Marque pelo menos um contato na tabela abaixo antes de iniciar o envio.");
       }
 
-      const alvoDesc = status_filtro === "SELECIONADOS"
-        ? `os ${lead_ids.length} lead(s) marcado(s) no grid`
-        : `leads com status '${status_filtro}'`;
+      const alvoDesc = status_filtro === "selecionados"
+        ? `os ${contato_ids.length} contato(s) marcado(s) no grid`
+        : `contatos com status '${status_filtro}'`;
       const extraMsg = enviar_ambos_numeros ? " (incluindo Telefone quando diferente do Celular)" : "";
       if (!confirm(`Deseja iniciar o envio em massa para ${alvoDesc}${extraMsg} respeitando as regras Anti-Banimento?`)) return;
 
       const res = await fetch("/api/admin/disparo-massa", {
         method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ template_id, setor_destino, status_filtro, enviar_ambos_numeros, lead_ids })
+        body: JSON.stringify({ template_id, setor_destino, status_filtro, enviar_ambos_numeros, contato_ids })
       });
       if (res.ok) {
         verificarProgressoCampanha();
