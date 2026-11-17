@@ -672,7 +672,11 @@ class AntiBanReq(BaseModel):
 class DisparoMassaReq(BaseModel):
     template_id: int
     setor_destino: str
-    apenas_novos: bool = True
+    status_filtro: str = "NOVO"
+
+
+class ExcluirMassaLeadsReq(BaseModel):
+    ids: List[int]
 
 
 class IniciarChatLeadReq(BaseModel):
@@ -973,6 +977,24 @@ async def importar_planilha_mapeada(
     return {"status": "ok", "importados": importados, "ignorados": ignorados, "total_lido": len(linhas)}
 
 
+@app.post("/api/admin/leads/excluir-massa")
+def excluir_leads_massa(dados: ExcluirMassaLeadsReq, request: Request):
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+    if not dados.ids:
+        raise HTTPException(status_code=400, detail="Nenhum lead selecionado para exclusão.")
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            placeholders = ", ".join(["%s"] * len(dados.ids))
+            cur.execute(f"DELETE FROM leads_crm WHERE id IN ({placeholders})", tuple(dados.ids))
+            excluidos = cur.rowcount
+        return {"status": "excluido", "total": excluidos}
+    finally:
+        conn.close()
+
+
 @app.delete("/api/admin/leads/{lead_id}")
 def excluir_lead(lead_id: int, request: Request):
     user = obter_usuario_atual(request)
@@ -1036,7 +1058,24 @@ def criar_template(dados: TemplateReq, request: Request):
                 "INSERT INTO templates_disparo (titulo, conteudo) VALUES (%s, %s)",
                 (dados.titulo.strip(), dados.conteudo.strip()),
             )
-        return {"status": "criado"}
+            novo_id = cur.lastrowid
+        return {"status": "criado", "id": novo_id}
+    finally:
+        conn.close()
+
+
+@app.put("/api/admin/templates/{tpl_id}")
+def atualizar_template(tpl_id: int, dados: TemplateReq, request: Request):
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE templates_disparo SET titulo = %s, conteudo = %s WHERE id = %s",
+                (dados.titulo.strip(), dados.conteudo.strip(), tpl_id),
+            )
+        return {"status": "atualizado", "id": tpl_id}
     finally:
         conn.close()
 
@@ -1149,6 +1188,7 @@ async def iniciar_disparo_massa(dados: DisparoMassaReq, request: Request, backgr
     if CAMPANHA_STATUS["em_execucao"]:
         raise HTTPException(status_code=400, detail="Já existe um disparo em massa em andamento.")
 
+    status_filtro = (dados.status_filtro or "NOVO").strip().upper()
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -1157,16 +1197,16 @@ async def iniciar_disparo_massa(dados: DisparoMassaReq, request: Request, backgr
             if not tpl:
                 raise HTTPException(status_code=404, detail="Template de mensagem não encontrado.")
 
-            if dados.apenas_novos:
-                cur.execute("SELECT * FROM leads_crm WHERE status_lead = 'NOVO' ORDER BY id ASC")
-            else:
+            if status_filtro == "TODOS":
                 cur.execute("SELECT * FROM leads_crm ORDER BY id ASC")
+            else:
+                cur.execute("SELECT * FROM leads_crm WHERE status_lead = %s ORDER BY id ASC", (status_filtro,))
             leads = cur.fetchall()
     finally:
         conn.close()
 
     if not leads:
-        raise HTTPException(status_code=400, detail="Nenhum lead disponível para o filtro selecionado.")
+        raise HTTPException(status_code=400, detail=f"Nenhum lead encontrado com o status '{status_filtro}'.")
 
     background_tasks.add_task(
         executar_campanha_background,
@@ -1695,24 +1735,37 @@ HTML_PAINEL = """
             </div>
           </div>
 
-          <!-- CARD 2: CADASTRAR MENSAGEM / TEMPLATE -->
+          <!-- CARD 2: SELECIONAR, EDITAR E CADASTRAR MENSAGENS -->
           <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col justify-between">
             <div>
-              <span class="text-[11px] font-bold uppercase tracking-wider text-blue-600">Passo 2 • Mensagem Cadastrada</span>
+              <span class="text-[11px] font-bold uppercase tracking-wider text-blue-600">Passo 2 • Gerenciar Mensagens</span>
               <h3 class="text-base font-bold text-slate-800 mt-1">Templates de Abordagem</h3>
               <p class="text-[11px] text-slate-500 mt-1">
                 Variáveis: <code>{nome}</code>, <code>{razao_social}</code>, <code>{cnpj}</code>, <code>{celular}</code>
               </p>
               <div class="mt-3 space-y-2">
+                <div class="flex gap-1.5">
+                  <select id="selectTemplateGerenciar" onchange="carregarTemplateParaEdicao()" class="flex-1 border border-slate-300 rounded-xl px-2.5 py-2 text-xs bg-slate-50 font-medium">
+                    <option value="">-- Nova Mensagem --</option>
+                  </select>
+                  <button type="button" onclick="novoTemplateForm()" title="Limpar para cadastrar nova mensagem" class="bg-slate-200 hover:bg-slate-300 text-slate-800 font-semibold px-3 py-2 rounded-xl text-xs transition">
+                    + Nova
+                  </button>
+                </div>
                 <input id="tplTitulo" type="text" placeholder="Título da campanha (ex: Prospecção Edital)"
                        class="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs" />
                 <textarea id="tplConteudo" rows="3" placeholder="Olá {nome} da {razao_social}..."
                           class="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"></textarea>
               </div>
             </div>
-            <button onclick="salvarTemplate()" class="mt-3 w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-xl text-xs transition">
-              + Salvar Mensagem Cadastrada
-            </button>
+            <div class="mt-3 flex gap-2">
+              <button onclick="salvarTemplate()" id="btnSalvarTemplate" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-xl text-xs transition">
+                Salvar Mensagem
+              </button>
+              <button onclick="excluirTemplateAtual()" id="btnExcluirTemplate" class="hidden bg-rose-50 hover:bg-rose-600 text-rose-700 hover:text-white border border-rose-200 font-semibold px-3.5 py-2.5 rounded-xl text-xs transition">
+                Excluir
+              </button>
+            </div>
           </div>
 
           <!-- CARD 3: EXECUTAR DISPARO EM MASSA -->
@@ -1729,10 +1782,16 @@ HTML_PAINEL = """
                   <label class="block text-[11px] font-semibold text-slate-600 mb-1">Departamento que receberá as respostas</label>
                   <select id="selectSetorDisparo" class="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs bg-white"></select>
                 </div>
-                <label class="flex items-center gap-2 text-xs text-slate-700 pt-1">
-                  <input type="checkbox" id="chkApenasNovos" checked class="rounded text-emerald-600" />
-                  Enviar apenas para leads com status <strong>NOVO</strong>
-                </label>
+                <div>
+                  <label class="block text-[11px] font-semibold text-slate-600 mb-1">Status dos Leads para Envio</label>
+                  <select id="selectStatusDisparo" class="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs bg-white font-medium text-slate-700">
+                    <option value="NOVO" selected>NOVO (Apenas não contatados)</option>
+                    <option value="CONTATADO">CONTATADO (Reengajamento / Follow-up)</option>
+                    <option value="EM_ATENDIMENTO">EM_ATENDIMENTO</option>
+                    <option value="FALHA_ENVIO">FALHA_ENVIO (Tentar novamente)</option>
+                    <option value="TODOS">TODOS OS LEADS DA BASE</option>
+                  </select>
+                </div>
               </div>
             </div>
             <div class="mt-3 space-y-2">
@@ -1749,15 +1808,23 @@ HTML_PAINEL = """
           <div class="px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
             <div>
               <h3 class="text-sm font-bold text-slate-800">Base de Leads Cadastrados (CRM)</h3>
-              <p class="text-xs text-slate-500">Total de empresas/contatos importados: <strong id="totalLeadsBadge">0</strong></p>
+              <p class="text-xs text-slate-500">Total de empresas/contatos exibidos: <strong id="totalLeadsBadge">0</strong></p>
             </div>
-            <input id="buscaLeadsCrm" oninput="renderizarTabelaLeads()" type="text" placeholder="Filtrar por CNPJ, Razão Social, Nome ou Telefone..."
-                   class="w-80 border border-slate-300 rounded-xl px-3.5 py-2 text-xs focus:outline-none focus:border-emerald-500" />
+            <div class="flex items-center gap-3">
+              <button id="btnExcluirMassaLeads" onclick="excluirLeadsEmMassa()" class="hidden bg-rose-600 hover:bg-rose-700 text-white font-semibold px-3.5 py-2 rounded-xl text-xs shadow-sm transition">
+                Excluir Selecionados (<span id="qtdLeadsSelecionados">0</span>)
+              </button>
+              <input id="buscaLeadsCrm" oninput="renderizarTabelaLeads()" type="text" placeholder="Filtrar por CNPJ, Razão Social, Nome, Status ou Telefone..."
+                     class="w-80 border border-slate-300 rounded-xl px-3.5 py-2 text-xs focus:outline-none focus:border-emerald-500" />
+            </div>
           </div>
           <div class="overflow-x-auto">
             <table class="w-full text-left text-xs">
               <thead class="bg-slate-50 border-b border-slate-200 uppercase text-slate-500 font-semibold">
                 <tr>
+                  <th class="px-4 py-3 w-10">
+                    <input type="checkbox" id="chkSelecionarTodosLeads" onclick="alternarSelecionarTodosLeads(this)" class="rounded text-emerald-600 cursor-pointer" title="Selecionar todos visíveis" />
+                  </th>
                   <th class="px-4 py-3">CNPJ</th>
                   <th class="px-4 py-3">Razão Social</th>
                   <th class="px-4 py-3">Contato / Nome</th>
@@ -1937,6 +2004,8 @@ HTML_PAINEL = """
     let PERFIS = [];
     let CHATS_CACHE = [];
     let LEADS_CACHE = [];
+    let LEADS_SELECIONADOS = new Set();
+    let TEMPLATES_CACHE = [];
     let PREVIEW_DATA = null;
     let JID_ATUAL = null;
     let intervalo = null;
@@ -2278,19 +2347,81 @@ HTML_PAINEL = """
       const res = await fetch("/api/admin/leads", { headers: authHeaders() });
       if (!res.ok) return;
       LEADS_CACHE = await res.json();
+      const idsValidos = new Set(LEADS_CACHE.map(l => l.id));
+      LEADS_SELECIONADOS = new Set([...LEADS_SELECIONADOS].filter(id => idsValidos.has(id)));
       renderizarTabelaLeads();
     }
 
-    function renderizarTabelaLeads() {
+    function obterLeadsFiltrados() {
       const termo = (document.getElementById("buscaLeadsCrm").value || "").toLowerCase();
-      const filtrados = LEADS_CACHE.filter(l =>
+      return LEADS_CACHE.filter(l =>
         (l.cnpj || "").toLowerCase().includes(termo) ||
         (l.razao_social || "").toLowerCase().includes(termo) ||
         (l.nome || "").toLowerCase().includes(termo) ||
+        (l.status_lead || "").toLowerCase().includes(termo) ||
         (l.celular || "").includes(termo) ||
         (l.telefone || "").includes(termo)
       );
+    }
+
+    function atualizarBarraExclusaoMassa(filtrados) {
+      const btnMassa = document.getElementById("btnExcluirMassaLeads");
+      const spanQtd = document.getElementById("qtdLeadsSelecionados");
+      const chkTodos = document.getElementById("chkSelecionarTodosLeads");
+
+      spanQtd.innerText = LEADS_SELECIONADOS.size;
+      if (LEADS_SELECIONADOS.size > 0) {
+        btnMassa.classList.remove("hidden");
+      } else {
+        btnMassa.classList.add("hidden");
+      }
+
+      if (filtrados.length > 0 && filtrados.every(l => LEADS_SELECIONADOS.has(l.id))) {
+        chkTodos.checked = true;
+      } else {
+        chkTodos.checked = false;
+      }
+    }
+
+    function alternarSelecaoLead(id, checked) {
+      if (checked) LEADS_SELECIONADOS.add(id);
+      else LEADS_SELECIONADOS.delete(id);
+      atualizarBarraExclusaoMassa(obterLeadsFiltrados());
+    }
+
+    function alternarSelecionarTodosLeads(checkbox) {
+      const filtrados = obterLeadsFiltrados();
+      if (checkbox.checked) {
+        filtrados.forEach(l => LEADS_SELECIONADOS.add(l.id));
+      } else {
+        filtrados.forEach(l => LEADS_SELECIONADOS.delete(l.id));
+      }
+      renderizarTabelaLeads();
+    }
+
+    async function excluirLeadsEmMassa() {
+      const ids = Array.from(LEADS_SELECIONADOS);
+      if (!ids.length) return;
+      if (!confirm(`Deseja realmente excluir ${ids.length} lead(s) selecionado(s) permanentemente?`)) return;
+
+      const res = await fetch("/api/admin/leads/excluir-massa", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ ids })
+      });
+      if (res.ok) {
+        LEADS_SELECIONADOS.clear();
+        await carregarLeads();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        alert(err.detail || "Erro ao excluir leads em massa.");
+      }
+    }
+
+    function renderizarTabelaLeads() {
+      const filtrados = obterLeadsFiltrados();
       document.getElementById("totalLeadsBadge").innerText = filtrados.length;
+      atualizarBarraExclusaoMassa(filtrados);
 
       const corStatus = {
         NOVO: "bg-sky-100 text-sky-800",
@@ -2300,7 +2431,12 @@ HTML_PAINEL = """
       };
 
       document.getElementById("tabelaLeadsBody").innerHTML = filtrados.map(l => `
-        <tr class="hover:bg-slate-50">
+        <tr class="hover:bg-slate-50 ${LEADS_SELECIONADOS.has(l.id) ? 'bg-rose-50/40' : ''}">
+          <td class="px-4 py-3">
+            <input type="checkbox" ${LEADS_SELECIONADOS.has(l.id) ? 'checked' : ''}
+                   onchange="alternarSelecaoLead(${l.id}, this.checked)"
+                   class="rounded text-emerald-600 cursor-pointer" />
+          </td>
           <td class="px-4 py-3 font-mono text-slate-600">${l.cnpj || '-'}</td>
           <td class="px-4 py-3 font-semibold text-slate-800">${l.razao_social || '-'}</td>
           <td class="px-4 py-3 text-slate-700">${l.nome || '-'}</td>
@@ -2333,43 +2469,104 @@ HTML_PAINEL = """
     async function excluirLead(id) {
       if (!confirm("Remover este lead do CRM?")) return;
       await fetch(`/api/admin/leads/${id}`, { method: "DELETE", headers: authHeaders() });
+      LEADS_SELECIONADOS.delete(id);
       carregarLeads();
     }
 
-    async function carregarTemplates() {
+    async function carregarTemplates(idSelecionado = null) {
       const res = await fetch("/api/admin/templates", { headers: authHeaders() });
       if (!res.ok) return;
-      const tpls = await res.json();
-      document.getElementById("selectTemplateDisparo").innerHTML = tpls.map(t =>
+      TEMPLATES_CACHE = await res.json();
+
+      document.getElementById("selectTemplateDisparo").innerHTML = TEMPLATES_CACHE.map(t =>
         `<option value="${t.id}">${t.titulo}</option>`
       ).join("");
+
+      const selGerenciar = document.getElementById("selectTemplateGerenciar");
+      const valorAtual = idSelecionado !== null ? String(idSelecionado) : selGerenciar.value;
+      selGerenciar.innerHTML = `<option value="">-- Cadastrar Nova Mensagem --</option>` +
+        TEMPLATES_CACHE.map(t => `<option value="${t.id}">${t.titulo}</option>`).join("");
+
+      if (valorAtual && TEMPLATES_CACHE.some(t => String(t.id) === String(valorAtual))) {
+        selGerenciar.value = String(valorAtual);
+        carregarTemplateParaEdicao();
+      } else {
+        novoTemplateForm();
+      }
+    }
+
+    function carregarTemplateParaEdicao() {
+      const tplId = document.getElementById("selectTemplateGerenciar").value;
+      if (!tplId) {
+        novoTemplateForm();
+        return;
+      }
+      const tpl = TEMPLATES_CACHE.find(t => String(t.id) === String(tplId));
+      if (!tpl) return;
+
+      document.getElementById("tplTitulo").value = tpl.titulo;
+      document.getElementById("tplConteudo").value = tpl.conteudo;
+      document.getElementById("btnSalvarTemplate").innerText = "Atualizar Mensagem";
+      document.getElementById("btnExcluirTemplate").classList.remove("hidden");
+      document.getElementById("selectTemplateDisparo").value = String(tpl.id);
+    }
+
+    function novoTemplateForm() {
+      document.getElementById("selectTemplateGerenciar").value = "";
+      document.getElementById("tplTitulo").value = "";
+      document.getElementById("tplConteudo").value = "";
+      document.getElementById("btnSalvarTemplate").innerText = "+ Cadastrar Mensagem";
+      document.getElementById("btnExcluirTemplate").classList.add("hidden");
     }
 
     async function salvarTemplate() {
-      const titulo = document.getElementById("tplTitulo").value;
-      const conteudo = document.getElementById("tplConteudo").value;
-      if (!titulo || !conteudo) return alert("Informe título e mensagem.");
-      const res = await fetch("/api/admin/templates", {
-        method: "POST", headers: authHeaders(), body: JSON.stringify({ titulo, conteudo })
+      const tplId = document.getElementById("selectTemplateGerenciar").value;
+      const titulo = document.getElementById("tplTitulo").value.trim();
+      const conteudo = document.getElementById("tplConteudo").value.trim();
+      if (!titulo || !conteudo) return alert("Informe o título e o conteúdo da mensagem.");
+
+      if (tplId) {
+        const res = await fetch(`/api/admin/templates/${tplId}`, {
+          method: "PUT", headers: authHeaders(), body: JSON.stringify({ titulo, conteudo })
+        });
+        if (res.ok) {
+          await carregarTemplates(tplId);
+          alert("Mensagem atualizada com sucesso!");
+        }
+      } else {
+        const res = await fetch("/api/admin/templates", {
+          method: "POST", headers: authHeaders(), body: JSON.stringify({ titulo, conteudo })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          await carregarTemplates(data.id || "");
+          alert("Mensagem cadastrada com sucesso!");
+        }
+      }
+    }
+
+    async function excluirTemplateAtual() {
+      const tplId = document.getElementById("selectTemplateGerenciar").value;
+      if (!tplId || !confirm("Deseja realmente excluir esta mensagem cadastrada?")) return;
+      const res = await fetch(`/api/admin/templates/${tplId}`, {
+        method: "DELETE", headers: authHeaders()
       });
       if (res.ok) {
-        document.getElementById("tplTitulo").value = "";
-        document.getElementById("tplConteudo").value = "";
-        carregarTemplates();
-        alert("Mensagem cadastrada com sucesso!");
+        await carregarTemplates("");
+        alert("Mensagem excluída.");
       }
     }
 
     async function iniciarDisparoMassa() {
       const template_id = parseInt(document.getElementById("selectTemplateDisparo").value);
       const setor_destino = document.getElementById("selectSetorDisparo").value;
-      const apenas_novos = document.getElementById("chkApenasNovos").checked;
+      const status_filtro = document.getElementById("selectStatusDisparo").value;
       if (!template_id) return alert("Cadastre ou selecione uma mensagem primeiro.");
-      if (!confirm("Deseja iniciar o envio em massa respeitando as regras Anti-Banimento?")) return;
+      if (!confirm(`Deseja iniciar o envio em massa para leads com status '${status_filtro}' respeitando as regras Anti-Banimento?`)) return;
 
       const res = await fetch("/api/admin/disparo-massa", {
         method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ template_id, setor_destino, apenas_novos })
+        body: JSON.stringify({ template_id, setor_destino, status_filtro })
       });
       if (res.ok) {
         verificarProgressoCampanha();
