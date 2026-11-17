@@ -95,6 +95,24 @@ def normalizar_numero_wa(celular: str, telefone: str = "") -> Optional[str]:
     return None
 
 
+def extrair_jids_lead(lead: Dict[str, Any], enviar_ambos: bool = False) -> List[str]:
+    """Retorna a lista de JIDs únicos do lead conforme a opção de enviar para ambos os números."""
+    jid_cel = normalizar_numero_wa(lead.get("celular", ""))
+    jid_tel = normalizar_numero_wa(lead.get("telefone", ""))
+
+    if not enviar_ambos:
+        principal = jid_cel or jid_tel or lead.get("jid")
+        return [principal] if principal else []
+
+    jids: List[str] = []
+    for j in (jid_cel, jid_tel, lead.get("jid")):
+        if j and j not in jids:
+            jids.append(j)
+            if not jid_cel or not jid_tel:
+                break
+    return jids
+
+
 def aplicar_variaveis_template(template: str, lead: Dict[str, Any]) -> str:
     texto = template
     mapa = {
@@ -673,6 +691,7 @@ class DisparoMassaReq(BaseModel):
     template_id: int
     setor_destino: str
     status_filtro: str = "NOVO"
+    enviar_ambos_numeros: bool = False
 
 
 class ExcluirMassaLeadsReq(BaseModel):
@@ -1127,51 +1146,68 @@ def salvar_antiban(dados: AntiBanReq, request: Request):
         conn.close()
 
 
-async def executar_campanha_background(leads: List[Dict[str, Any]], template_texto: str, setor_destino: str, autor: str):
+async def executar_campanha_background(
+    leads: List[Dict[str, Any]],
+    template_texto: str,
+    setor_destino: str,
+    autor: str,
+    enviar_ambos_numeros: bool = False,
+):
+    fila_envios = []
+    for lead in leads:
+        jids = extrair_jids_lead(lead, enviar_ambos=enviar_ambos_numeros)
+        if jids:
+            fila_envios.append((lead, jids))
+
+    total_mensagens = sum(len(jids) for _, jids in fila_envios)
     CAMPANHA_STATUS["em_execucao"] = True
-    CAMPANHA_STATUS["total"] = len(leads)
+    CAMPANHA_STATUS["total"] = total_mensagens
     CAMPANHA_STATUS["enviados"] = 0
     CAMPANHA_STATUS["falhas"] = 0
 
     try:
-        for lead in leads:
-            jid = lead["jid"]
-            nome_lead = lead.get("nome") or lead.get("razao_social") or jid.split("@")[0]
-            CAMPANHA_STATUS["atual"] = f"{nome_lead} ({jid.split('@')[0]})"
-            CAMPANHA_STATUS["mensagem_status"] = f"Enviando para {nome_lead}..."
-
+        for lead, jids in fila_envios:
+            nome_lead = lead.get("nome") or lead.get("razao_social") or jids[0].split("@")[0]
             mensagem_final = aplicar_variaveis_template(template_texto, lead)
-            ok = await enviar_texto_wa(jid, mensagem_final)
+            algum_sucesso = False
+
+            for idx, jid in enumerate(jids):
+                tag_num = f" [{idx + 1}/{len(jids)}]" if len(jids) > 1 else ""
+                CAMPANHA_STATUS["atual"] = f"{nome_lead} ({jid.split('@')[0]}){tag_num}"
+                CAMPANHA_STATUS["mensagem_status"] = f"Enviando para {nome_lead} ({jid.split('@')[0]}){tag_num}..."
+
+                ok = await enviar_texto_wa(jid, mensagem_final)
+                if ok:
+                    CAMPANHA_STATUS["enviados"] += 1
+                    algum_sucesso = True
+                    registrar_mensagem(
+                        jid=jid,
+                        remetente=f"CAMPANHA ({autor})",
+                        conteudo=mensagem_final,
+                        nome=nome_lead,
+                        incrementar_nao_lidas=False,
+                        tipo_midia="TEXT",
+                        setor_padrao=setor_destino,
+                        status_padrao="EM_ATENDIMENTO",
+                    )
+                else:
+                    CAMPANHA_STATUS["falhas"] += 1
 
             conn = get_db_connection()
             try:
                 with conn.cursor() as cur:
-                    if ok:
-                        CAMPANHA_STATUS["enviados"] += 1
+                    if algum_sucesso:
                         cur.execute(
                             "UPDATE leads_crm SET status_lead = 'CONTATADO', ultimo_disparo = NOW() WHERE id = %s",
                             (lead["id"],),
                         )
                     else:
-                        CAMPANHA_STATUS["falhas"] += 1
                         cur.execute(
                             "UPDATE leads_crm SET status_lead = 'FALHA_ENVIO' WHERE id = %s",
                             (lead["id"],),
                         )
             finally:
                 conn.close()
-
-            if ok:
-                registrar_mensagem(
-                    jid=jid,
-                    remetente=f"CAMPANHA ({autor})",
-                    conteudo=mensagem_final,
-                    nome=nome_lead,
-                    incrementar_nao_lidas=False,
-                    tipo_midia="TEXT",
-                    setor_padrao=setor_destino,
-                    status_padrao="EM_ATENDIMENTO",
-                )
     finally:
         CAMPANHA_STATUS["em_execucao"] = False
         CAMPANHA_STATUS["atual"] = ""
@@ -1208,14 +1244,17 @@ async def iniciar_disparo_massa(dados: DisparoMassaReq, request: Request, backgr
     if not leads:
         raise HTTPException(status_code=400, detail=f"Nenhum lead encontrado com o status '{status_filtro}'.")
 
+    total_destinos = sum(len(extrair_jids_lead(l, dados.enviar_ambos_numeros)) for l in leads)
+
     background_tasks.add_task(
         executar_campanha_background,
         leads,
         tpl["conteudo"],
         dados.setor_destino,
         user["nome"],
+        dados.enviar_ambos_numeros,
     )
-    return {"status": "iniciado", "total": len(leads)}
+    return {"status": "iniciado", "total": total_destinos, "leads": len(leads)}
 
 
 @app.get("/api/admin/disparo-massa/status")
@@ -1792,6 +1831,10 @@ HTML_PAINEL = """
                     <option value="TODOS">TODOS OS LEADS DA BASE</option>
                   </select>
                 </div>
+                <label class="flex items-center gap-2 text-xs text-slate-700 pt-1 cursor-pointer">
+                  <input type="checkbox" id="chkEnviarAmbosNumeros" class="rounded text-emerald-600" />
+                  <span>Enviar também para o <strong>Telefone</strong> (se for diferente do Celular)</span>
+                </label>
               </div>
             </div>
             <div class="mt-3 space-y-2">
@@ -2248,7 +2291,6 @@ HTML_PAINEL = """
           document.getElementById(id).innerHTML = opcoes;
         });
 
-        // Auto-vincula se encontrar nomes parecidos
         document.getElementById("mapColCnpj").value = autoDetectarColuna(PREVIEW_DATA.colunas, ["cnpj", "documento"]);
         document.getElementById("mapColRazao").value = autoDetectarColuna(PREVIEW_DATA.colunas, ["razao", "empresa", "fantasia"]);
         document.getElementById("mapColNome").value = autoDetectarColuna(PREVIEW_DATA.colunas, ["nome", "contato", "socio", "responsavel"]);
@@ -2440,7 +2482,7 @@ HTML_PAINEL = """
           <td class="px-4 py-3 font-mono text-slate-600">${l.cnpj || '-'}</td>
           <td class="px-4 py-3 font-semibold text-slate-800">${l.razao_social || '-'}</td>
           <td class="px-4 py-3 text-slate-700">${l.nome || '-'}</td>
-          <td class="px-4 py-3 font-mono text-slate-700">${l.celular || l.telefone}</td>
+          <td class="px-4 py-3 font-mono text-slate-700">${[l.celular, l.telefone].filter(Boolean).join(" / ") || '-'}</td>
           <td class="px-4 py-3"><span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold ${corStatus[l.status_lead] || 'bg-slate-100 text-slate-700'}">${l.status_lead}</span></td>
           <td class="px-4 py-3 text-right space-x-2">
             <button onclick="abrirConversaDoLead(${l.id})" class="bg-emerald-50 hover:bg-emerald-600 text-emerald-700 hover:text-white border border-emerald-200 px-2.5 py-1 rounded-lg font-semibold transition">
@@ -2561,12 +2603,14 @@ HTML_PAINEL = """
       const template_id = parseInt(document.getElementById("selectTemplateDisparo").value);
       const setor_destino = document.getElementById("selectSetorDisparo").value;
       const status_filtro = document.getElementById("selectStatusDisparo").value;
+      const enviar_ambos_numeros = document.getElementById("chkEnviarAmbosNumeros").checked;
       if (!template_id) return alert("Cadastre ou selecione uma mensagem primeiro.");
-      if (!confirm(`Deseja iniciar o envio em massa para leads com status '${status_filtro}' respeitando as regras Anti-Banimento?`)) return;
+      const extraMsg = enviar_ambos_numeros ? " (incluindo Telefone quando diferente do Celular)" : "";
+      if (!confirm(`Deseja iniciar o envio em massa para leads com status '${status_filtro}'${extraMsg} respeitando as regras Anti-Banimento?`)) return;
 
       const res = await fetch("/api/admin/disparo-massa", {
         method: "POST", headers: authHeaders(),
-        body: JSON.stringify({ template_id, setor_destino, status_filtro })
+        body: JSON.stringify({ template_id, setor_destino, status_filtro, enviar_ambos_numeros })
       });
       if (res.ok) {
         verificarProgressoCampanha();
