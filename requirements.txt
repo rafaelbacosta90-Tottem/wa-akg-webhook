@@ -4,3 +4,4 @@ httpx
 pymysql
 cryptography
 python-multipart
+imageio-ffmpeg
