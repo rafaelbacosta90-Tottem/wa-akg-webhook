@@ -4,14 +4,16 @@ import uuid
 import hashlib
 import secrets
 import logging
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 import httpx
 import pymysql
+import imageio_ffmpeg
 from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -41,10 +43,23 @@ app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 
 # ==============================================================================
-# UTILITÁRIOS DE SEGURANÇA E HASH
+# UTILITÁRIOS DE SEGURANÇA E CONVERSÃO DE ÁUDIO
 # ==============================================================================
 def hash_senha(senha: str) -> str:
     return hashlib.sha256(senha.encode("utf-8")).hexdigest()
+
+
+def converter_para_mp3(origem: Path) -> Path:
+    """Converte áudio WebM/OGG do navegador para MP3 compatível com WhatsApp iOS/Android."""
+    destino_mp3 = origem.with_suffix(".mp3")
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg_exe, "-y", "-i", str(origem),
+        "-vn", "-ar", "44100", "-ac", "1", "-b:a", "64k",
+        str(destino_mp3)
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return destino_mp3
 
 
 # ==============================================================================
@@ -187,24 +202,31 @@ async def enviar_texto_wa(jid: str, texto: str) -> bool:
 
 async def enviar_midia_wa(jid: str, file_path: Path, filename: str, media_type: str, caption: str = "") -> bool:
     url = f"{WA_BASE_URL}/messages/{SESSION_ID}/{jid}/media"
-    async with httpx.AsyncClient(timeout=40.0) as client:
+    mime_map = {
+        "audio": "audio/mpeg",
+        "voice": "audio/mpeg",
+        "image": "image/jpeg",
+        "video": "video/mp4",
+        "document": "application/pdf",
+    }
+    mime = mime_map.get(media_type, "application/octet-stream")
+
+    async with httpx.AsyncClient(timeout=45.0) as client:
         try:
             with open(file_path, "rb") as f:
-                files = {"file": (filename, f)}
-                data = {"type": media_type, "caption": caption}
+                files = {"file": (filename, f, mime)}
+                tipo_api = "audio" if media_type in {"audio", "voice"} else media_type
+                data = {"type": tipo_api, "caption": caption}
                 resp = await client.post(url, headers=HEADERS_WA, files=files, data=data)
-                logger.info(f"Envio Mídia WA ({media_type}) -> {jid} | Status: {resp.status_code}")
+                logger.info(f"Envio Mídia WA ({tipo_api}) -> {jid} | Status: {resp.status_code} | Resp: {resp.text}")
                 return resp.status_code in (200, 201)
         except Exception as e:
             logger.error(f"Erro envio mídia WA: {e}")
             return False
 
 
-async def baixar_midia_wa(message_id: str, tipo: str) -> Optional[str]:
-    """Baixa a mídia recebida pelo WA-AKG e salva localmente para exibição no painel."""
-    if not message_id:
-        return None
-    url = f"{WA_BASE_URL}/messages/{SESSION_ID}/download/{message_id}/media"
+async def baixar_midia_wa(data: Dict[str, Any], key: Dict[str, Any], tipo: str) -> Optional[str]:
+    """Baixa mídia usando fileUrl direto do payload ou a rota /download/{messageId}/media."""
     ext_map = {
         "IMAGE": ".jpg",
         "AUDIO": ".ogg",
@@ -214,17 +236,34 @@ async def baixar_midia_wa(message_id: str, tipo: str) -> Optional[str]:
         "STICKER": ".webp",
     }
     ext = ext_map.get(tipo.upper(), ".bin")
-    nome_arquivo = f"in_{uuid.uuid4().hex}{ext}"
-    destino = MEDIA_DIR / nome_arquivo
+    file_url = data.get("fileUrl")
+
+    urls_tentativa: List[str] = []
+
+    if file_url:
+        if file_url.startswith("http"):
+            urls_tentativa.append(file_url)
+        else:
+            base_host = WA_BASE_URL.replace("/api", "")
+            urls_tentativa.append(f"{base_host}{file_url if file_url.startswith('/') else '/' + file_url}")
+
+    for mid in [data.get("id"), key.get("id")]:
+        if mid:
+            urls_tentativa.append(f"{WA_BASE_URL}/messages/{SESSION_ID}/download/{mid}/media")
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.get(url, headers=HEADERS_WA, follow_redirects=True)
-            if resp.status_code == 200 and resp.content:
-                destino.write_bytes(resp.content)
-                return f"/media/{nome_arquivo}"
-        except Exception as e:
-            logger.error(f"Falha ao baixar mídia {message_id}: {e}")
+        for url in urls_tentativa:
+            try:
+                resp = await client.get(url, headers=HEADERS_WA, follow_redirects=True)
+                logger.info(f"Tentativa download mídia ({url}) -> Status: {resp.status_code} | Bytes: {len(resp.content)}")
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    nome_arquivo = f"in_{uuid.uuid4().hex}{ext}"
+                    destino = MEDIA_DIR / nome_arquivo
+                    destino.write_bytes(resp.content)
+                    return f"/media/{nome_arquivo}"
+            except Exception as e:
+                logger.error(f"Erro ao baixar mídia de {url}: {e}")
+
     return None
 
 
@@ -285,7 +324,6 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
             jid = f"{jid}@s.whatsapp.net"
 
         push_name = data.get("pushName") or payload.get("pushName") or jid.split("@")[0]
-        msg_id = key.get("id") or data.get("id") or ""
         msg_type = (data.get("type") or "TEXT").upper()
 
         texto = (
@@ -297,10 +335,9 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
             or ""
         ).strip()
 
-        # Detecta e baixa mídia (Áudio, Imagem, Documento, Vídeo)
         url_midia = None
         if msg_type in {"IMAGE", "AUDIO", "VOICE", "VIDEO", "DOCUMENT", "STICKER"} or data.get("fileUrl"):
-            url_midia = await baixar_midia_wa(msg_id, msg_type)
+            url_midia = await baixar_midia_wa(data, key, msg_type)
             if not texto:
                 texto = f"Arquivo recebido ({msg_type})"
         else:
@@ -331,11 +368,9 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
             url_midia=url_midia,
         )
 
-        # Se já está em atendimento humano, não dispara menu (salvo #menu)
         if status_atual == "EM_ATENDIMENTO" and texto.lower() not in {"#menu", "#sair"}:
             return
 
-        # Verifica se o texto corresponde à opção numérica de algum perfil cadastrado
         perfil_escolhido = next((p for p in perfis if p["opcao_menu"].strip() == texto), None)
 
         if perfil_escolhido:
@@ -352,7 +387,8 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
                 conn.close()
 
             resp_msg = (
-                f"✅ Você foi direcionado para *{nome_setor}*.\n"
+                f"✅ Você foi direcionado para *{nome_setor}*.
+"
                 "Pode enviar sua mensagem, áudio ou anexo que nossa equipe já vai lhe atender."
             )
             await enviar_texto_wa(jid, resp_msg)
@@ -368,10 +404,14 @@ async def processar_webhook(payload: Dict[str, Any]) -> None:
             finally:
                 conn.close()
 
-            linhas_opcoes = "\n".join([f"*{p['opcao_menu']}* - {p['nome']}" for p in perfis])
+            linhas_opcoes = "
+".join([f"*{p['opcao_menu']}* - {p['nome']}" for p in perfis])
             menu = (
-                f"Olá, *{push_name}*! Bem-vindo à *Tottem Tecnologia*.\n\n"
-                f"Responda apenas com o número do departamento desejado:\n{linhas_opcoes}"
+                f"Olá, *{push_name}*! Bem-vindo à *Tottem Tecnologia*.
+
+"
+                f"Responda apenas com o número do departamento desejado:
+{linhas_opcoes}"
             )
             await enviar_texto_wa(jid, menu)
             registrar_mensagem(jid, "BOT", menu)
@@ -635,7 +675,6 @@ def listar_chats(request: Request, filtro_setor: Optional[str] = None):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Admin pode filtrar qualquer setor; atendente vê apenas seu perfil vinculado
             if user["role"] == "ADMIN":
                 if filtro_setor and filtro_setor != "TODOS":
                     cur.execute(
@@ -694,7 +733,7 @@ async def responder_texto(dados: EnvioTextoReq, request: Request):
 async def responder_midia(
     request: Request,
     jid: str = Form(...),
-    tipo: str = Form(...),  # image, audio, voice, document, video
+    tipo: str = Form(...),
     legenda: str = Form(""),
     arquivo: UploadFile = File(...),
 ):
@@ -706,12 +745,20 @@ async def responder_midia(
     conteudo_bytes = await arquivo.read()
     caminho_salvo.write_bytes(conteudo_bytes)
 
-    sucesso = await enviar_midia_wa(jid, caminho_salvo, arquivo.filename or nome_salvo, tipo, legenda)
+    if tipo in {"voice", "audio"} and ext.lower() not in {".mp3"}:
+        try:
+            caminho_mp3 = converter_para_mp3(caminho_salvo)
+            caminho_salvo = caminho_mp3
+            nome_salvo = caminho_mp3.name
+        except Exception as e:
+            logger.error(f"Erro na conversão FFmpeg para MP3: {e}")
+
+    sucesso = await enviar_midia_wa(jid, caminho_salvo, nome_salvo, tipo, legenda)
     if not sucesso:
         raise HTTPException(status_code=500, detail="Falha ao enviar mídia pelo WA-AKG")
 
     assinatura = f"{user['nome']} ({user['perfil_codigo'] or 'ADMIN'})"
-    texto_registro = legenda if legenda else f"Arquivo enviado: {arquivo.filename}"
+    texto_registro = legenda if legenda else f"Arquivo enviado: {nome_salvo}"
     registrar_mensagem(
         jid,
         assinatura,
@@ -1021,7 +1068,6 @@ HTML_PAINEL = """
       if (!res.ok) return;
       PERFIS = await res.json();
 
-      // Preenche selects de transferência, filtro admin e vínculo de usuário
       const selTransf = document.getElementById("selectTransferir");
       selTransf.innerHTML = PERFIS.map(p => `<option value="${p.codigo}">${p.nome}</option>`).join("");
 
@@ -1266,12 +1312,12 @@ HTML_PAINEL = """
           audioChunks = [];
           mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
           mediaRecorder.onstop = async () => {
-            const blob = new Blob(audioChunks, { type: "audio/ogg; codecs=opus" });
+            const blob = new Blob(audioChunks, { type: "audio/webm" });
             const formData = new FormData();
             formData.append("jid", JID_ATUAL);
             formData.append("tipo", "voice");
             formData.append("legenda", "");
-            formData.append("arquivo", blob, "audio_gravado.ogg");
+            formData.append("arquivo", blob, "audio_gravado.webm");
 
             await fetch("/api/painel/enviar-midia", {
               method: "POST",
