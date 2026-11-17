@@ -47,7 +47,6 @@ MEDIA_DIR = Path("media_files")
 MEDIA_DIR.mkdir(exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
-# Estado em memória da janela deslizante Anti-Banimento e progresso de disparo
 RATE_LIMIT_STATE = {
     "window_start": 0.0,
     "count": 0,
@@ -87,6 +86,8 @@ def normalizar_numero_wa(celular: str, telefone: str = "") -> Optional[str]:
     """Prioriza celular; se vazio, usa telefone. Retorna JID formatado (55...)."""
     for bruto in (celular, telefone):
         digitos = re.sub(r"\D", "", str(bruto or ""))
+        if digitos.startswith("0"):
+            digitos = digitos.lstrip("0")
         if len(digitos) >= 10:
             if not digitos.startswith("55") and len(digitos) in (10, 11):
                 digitos = "55" + digitos
@@ -106,6 +107,67 @@ def aplicar_variaveis_template(template: str, lead: Dict[str, Any]) -> str:
     for chave, valor in mapa.items():
         texto = texto.replace(chave, str(valor))
     return texto
+
+
+def ler_planilha_bruta(conteudo: bytes, filename: str) -> Dict[str, Any]:
+    """Lê .xlsx, .xlsm ou .csv com detecção automática de encoding e delimitador."""
+    nome_arq = (filename or "").lower()
+    colunas: List[str] = []
+    linhas: List[List[str]] = []
+
+    if nome_arq.endswith((".xlsx", ".xlsm")):
+        wb = openpyxl.load_workbook(io.BytesIO(conteudo), data_only=True, read_only=True)
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        header_row = next(rows_iter, None)
+        if not header_row:
+            raise HTTPException(status_code=400, detail="Planilha Excel está vazia.")
+
+        colunas = [
+            str(c).strip() if c is not None and str(c).strip() else f"Coluna_{idx+1}"
+            for idx, c in enumerate(header_row)
+        ]
+        for r in rows_iter:
+            if not any(cell is not None and str(cell).strip() != "" for cell in r):
+                continue
+            linha_str = [str(r[i]).strip() if i < len(r) and r[i] is not None else "" for i in range(len(colunas))]
+            linhas.append(linha_str)
+    else:
+        texto_csv = None
+        for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+            try:
+                texto_csv = conteudo.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if texto_csv is None:
+            texto_csv = conteudo.decode("utf-8", errors="ignore")
+
+        linhas_raw = [l for l in texto_csv.splitlines() if l.strip()]
+        if not linhas_raw:
+            raise HTTPException(status_code=400, detail="Arquivo CSV está vazio.")
+
+        primeira = linhas_raw[0]
+        delimitador = ";" if primeira.count(";") >= primeira.count(",") else ","
+        if "\t" in primeira and primeira.count("\t") > primeira.count(delimitador):
+            delimitador = "\t"
+
+        reader = csv.reader(io.StringIO("\n".join(linhas_raw)), delimiter=delimitador)
+        header_row = next(reader, None)
+        if not header_row:
+            raise HTTPException(status_code=400, detail="Cabeçalho CSV não encontrado.")
+
+        colunas = [
+            str(c).strip() if c and str(c).strip() else f"Coluna_{idx+1}"
+            for idx, c in enumerate(header_row)
+        ]
+        for r in reader:
+            if not any(cell and str(cell).strip() != "" for cell in r):
+                continue
+            linha_str = [str(r[i]).strip() if i < len(r) and r[i] is not None else "" for i in range(len(colunas))]
+            linhas.append(linha_str)
+
+    return {"colunas": colunas, "linhas": linhas}
 
 
 # ==============================================================================
@@ -271,7 +333,7 @@ def on_startup():
 
 
 # ==============================================================================
-# MOTOR DE PROTEÇÃO ANTI-BANIMENTO (JANELA DE TEMPO + ATRASO ALEATÓRIO)
+# MOTOR DE PROTEÇÃO ANTI-BANIMENTO
 # ==============================================================================
 def obter_config_antiban_db() -> Dict[str, Any]:
     conn = get_db_connection()
@@ -291,7 +353,6 @@ def obter_config_antiban_db() -> Dict[str, Any]:
 
 
 async def aguardar_protecao_antiban():
-    """Aplica o controle de taxa por janela de tempo configurado no painel."""
     cfg = obter_config_antiban_db()
     if not cfg.get("habilitado"):
         return
@@ -805,7 +866,7 @@ def excluir_usuario(usuario_id: int, request: Request):
         conn.close()
 
 
-# --- ROTAS CRM LEADS, IMPORTAÇÃO PLANILHA, TEMPLATES E DISPARO EM MASSA ---
+# --- ROTAS CRM LEADS: PREVIEW + MAPEAMENTO DE COLUNAS + IMPORTAÇÃO ---
 @app.get("/api/admin/leads")
 def listar_leads(request: Request):
     user = obter_usuario_atual(request)
@@ -819,49 +880,73 @@ def listar_leads(request: Request):
         conn.close()
 
 
-@app.post("/api/admin/leads/importar")
-async def importar_planilha_leads(request: Request, arquivo: UploadFile = File(...)):
+@app.post("/api/admin/leads/preview")
+async def preview_planilha_leads(request: Request, arquivo: UploadFile = File(...)):
+    """Lê a planilha enviada e retorna as colunas e uma prévia das 10 primeiras linhas para mapeamento."""
     user = obter_usuario_atual(request)
     exigir_admin(user)
 
     conteudo = await arquivo.read()
-    nome_arq = (arquivo.filename or "").lower()
-    linhas_dict: List[Dict[str, str]] = []
+    if not conteudo:
+        raise HTTPException(status_code=400, detail="O arquivo enviado está vazio.")
 
-    if nome_arq.endswith(".xlsx"):
-        wb = openpyxl.load_workbook(io.BytesIO(conteudo), data_only=True)
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
-            raise HTTPException(status_code=400, detail="Planilha vazia.")
-        cabecalhos = [str(c or "").strip().lower() for c in rows[0]]
-        for r in rows[1:]:
-            linhas_dict.append({cabecalhos[i]: str(r[i] or "").strip() for i in range(len(cabecalhos)) if i < len(r)})
-    else:
-        texto_csv = conteudo.decode("utf-8-sig", errors="ignore")
-        delimitador = ";" if ";" in texto_csv.splitlines()[0] else ","
-        reader = csv.DictReader(io.StringIO(texto_csv), delimiter=delimitador)
-        for row in reader:
-            linhas_dict.append({str(k or "").strip().lower(): str(v or "").strip() for k, v in row.items()})
+    dados = ler_planilha_bruta(conteudo, arquivo.filename or "planilha.csv")
+    return {
+        "filename": arquivo.filename,
+        "colunas": dados["colunas"],
+        "preview": dados["linhas"][:10],
+        "total_linhas": len(dados["linhas"]),
+    }
 
-    def buscar_col(d: Dict[str, str], chaves: List[str]) -> str:
-        for k, v in d.items():
-            k_norm = k.replace("ã", "a").replace("ç", "c").replace("_", " ").strip()
-            if k_norm in chaves and v:
-                return v
-        return ""
+
+@app.post("/api/admin/leads/importar-mapeado")
+async def importar_planilha_mapeada(
+    request: Request,
+    arquivo: UploadFile = File(...),
+    col_cnpj: str = Form(""),
+    col_nome: str = Form(""),
+    col_razao: str = Form(""),
+    col_telefone: str = Form(""),
+    col_celular: str = Form(""),
+):
+    """Importa os dados da planilha usando o vínculo de colunas escolhido pelo administrador."""
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+
+    conteudo = await arquivo.read()
+    dados = ler_planilha_bruta(conteudo, arquivo.filename or "planilha.csv")
+    colunas = dados["colunas"]
+    linhas = dados["linhas"]
+
+    def idx_coluna(col_param: str) -> Optional[int]:
+        if col_param == "" or col_param == "-1":
+            return None
+        try:
+            i = int(col_param)
+            return i if 0 <= i < len(colunas) else None
+        except ValueError:
+            return colunas.index(col_param) if col_param in colunas else None
+
+    i_cnpj = idx_coluna(col_cnpj)
+    i_nome = idx_coluna(col_nome)
+    i_razao = idx_coluna(col_razao)
+    i_tel = idx_coluna(col_telefone)
+    i_cel = idx_coluna(col_celular)
+
+    if i_tel is None and i_cel is None:
+        raise HTTPException(status_code=400, detail="Vincule pelo menos a coluna de Celular ou Telefone.")
 
     importados = 0
     ignorados = 0
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            for item in linhas_dict:
-                cnpj = buscar_col(item, ["cnpj", "cpf/cnpj", "documento"])
-                nome = buscar_col(item, ["nome", "contato", "responsavel", "socio"])
-                razao = buscar_col(item, ["razao social", "razao", "empresa", "fantasia"])
-                telefone = buscar_col(item, ["telefone", "fone", "tel", "telefone fixo"])
-                celular = buscar_col(item, ["celular", "whatsapp", "cel", "movel"])
+            for row in linhas:
+                cnpj = row[i_cnpj] if i_cnpj is not None and i_cnpj < len(row) else ""
+                nome = row[i_nome] if i_nome is not None and i_nome < len(row) else ""
+                razao = row[i_razao] if i_razao is not None and i_razao < len(row) else ""
+                telefone = row[i_tel] if i_tel is not None and i_tel < len(row) else ""
+                celular = row[i_cel] if i_cel is not None and i_cel < len(row) else ""
 
                 jid = normalizar_numero_wa(celular, telefone)
                 if not jid:
@@ -885,7 +970,7 @@ async def importar_planilha_leads(request: Request, arquivo: UploadFile = File(.
     finally:
         conn.close()
 
-    return {"status": "ok", "importados": importados, "ignorados": ignorados}
+    return {"status": "ok", "importados": importados, "ignorados": ignorados, "total_lido": len(linhas)}
 
 
 @app.delete("/api/admin/leads/{lead_id}")
@@ -1276,7 +1361,7 @@ async def encerrar_atendimento(dados: AcaoTicketReq, request: Request):
 
 
 # ==============================================================================
-# INTERFACE ENTERPRISE OMNICHANNEL + CRM + ANTI-BAN (/painel)
+# INTERFACE ENTERPRISE OMNICHANNEL + CRM + PREVIEW MAPEAMENTO (/painel)
 # ==============================================================================
 HTML_PAINEL = """
 <!DOCTYPE html>
@@ -1340,6 +1425,78 @@ HTML_PAINEL = """
         <button onclick="fazerLogin()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-3 rounded-xl shadow-lg shadow-emerald-600/20 transition text-sm">
           Entrar na Plataforma
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL DE PREVIEW E MAPEAMENTO DA PLANILHA -->
+  <div id="modalPreviewPlanilha" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-6xl max-h-[90vh] flex flex-col overflow-hidden">
+      <div class="px-6 py-4 bg-slate-900 text-white flex items-center justify-between">
+        <div>
+          <h3 class="text-base font-bold">Mapeamento de Colunas e Prévia da Importação</h3>
+          <p class="text-xs text-slate-300 mt-0.5">
+            Arquivo: <strong id="prevNomeArquivo" class="text-emerald-400"></strong> • Total de registros detectados: <strong id="prevTotalLinhas">0</strong>
+          </p>
+        </div>
+        <button onclick="fecharModalPreview()" class="text-slate-400 hover:text-white text-xl font-bold px-2">&times;</button>
+      </div>
+
+      <!-- SELETORES DE VÍNCULO DE COLUNA -->
+      <div class="p-6 bg-slate-50 border-b border-slate-200">
+        <div class="text-xs font-bold uppercase tracking-wider text-slate-500 mb-3">
+          Vincule cada campo do CRM à coluna correspondente da sua planilha:
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-4">
+          <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+            <label class="block text-xs font-bold text-slate-700 mb-1">CNPJ</label>
+            <select id="mapColCnpj" onchange="atualizarHighlightPreview()" class="w-full border border-slate-300 rounded-lg px-2.5 py-2 text-xs bg-white"></select>
+          </div>
+          <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+            <label class="block text-xs font-bold text-slate-700 mb-1">Razão Social</label>
+            <select id="mapColRazao" onchange="atualizarHighlightPreview()" class="w-full border border-slate-300 rounded-lg px-2.5 py-2 text-xs bg-white"></select>
+          </div>
+          <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+            <label class="block text-xs font-bold text-slate-700 mb-1">Nome / Contato</label>
+            <select id="mapColNome" onchange="atualizarHighlightPreview()" class="w-full border border-slate-300 rounded-lg px-2.5 py-2 text-xs bg-white"></select>
+          </div>
+          <div class="bg-white p-3 rounded-xl border border-emerald-300 shadow-sm">
+            <label class="block text-xs font-bold text-emerald-700 mb-1">Celular (WhatsApp) *</label>
+            <select id="mapColCelular" onchange="atualizarHighlightPreview()" class="w-full border border-emerald-400 rounded-lg px-2.5 py-2 text-xs bg-white"></select>
+          </div>
+          <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
+            <label class="block text-xs font-bold text-slate-700 mb-1">Telefone Fixo / Alt.</label>
+            <select id="mapColTelefone" onchange="atualizarHighlightPreview()" class="w-full border border-slate-300 rounded-lg px-2.5 py-2 text-xs bg-white"></select>
+          </div>
+        </div>
+      </div>
+
+      <!-- TABELA DE PREVIEW -->
+      <div class="flex-1 overflow-auto p-6">
+        <div class="text-xs font-semibold text-slate-600 mb-2">
+          Pré-visualização das primeiras linhas da planilha (confira se os dados correspondem às colunas vinculadas):
+        </div>
+        <div class="border border-slate-200 rounded-xl overflow-x-auto">
+          <table class="w-full text-left text-xs">
+            <thead id="prevTableHead" class="bg-slate-100 border-b border-slate-200 text-slate-700 font-bold"></thead>
+            <tbody id="prevTableBody" class="divide-y divide-slate-100"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- RODAPÉ DE CONFIRMAÇÃO -->
+      <div class="px-6 py-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between">
+        <span class="text-xs text-slate-500">
+          * O sistema adicionará automaticamente o código do Brasil (<strong>55</strong>) e ignorará linhas sem telefone válido.
+        </span>
+        <div class="flex items-center gap-3">
+          <button onclick="fecharModalPreview()" class="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 font-semibold text-xs hover:bg-slate-100">
+            Cancelar
+          </button>
+          <button id="btnConfirmarImportacao" onclick="confirmarImportacaoMapeada()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-6 py-2.5 rounded-xl text-xs shadow-sm transition">
+            Confirmar e Importar Leads
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -1472,7 +1629,6 @@ HTML_PAINEL = """
         </div>
       </main>
 
-      <!-- PAINEL DIREITO: DETALHES CRM -->
       <aside id="painelDireito" class="hidden w-72 bg-white border-l border-slate-200 flex flex-col p-4 space-y-5 overflow-y-auto">
         <div id="blocoDadosEmpresa" class="hidden bg-emerald-50/60 border border-emerald-200/80 rounded-xl p-3 space-y-1.5">
           <div class="text-[10px] font-bold uppercase tracking-wider text-emerald-700">Dados Cadastrais (CRM)</div>
@@ -1512,30 +1668,30 @@ HTML_PAINEL = """
     </div>
 
     <!-- =================================================================== -->
-    <!-- ABA 2: CRM DE LEADS, IMPORTAÇÃO PLANILHA E DISPARO EM MASSA         -->
+    <!-- ABA 2: CRM DE LEADS, PREVIEW/MAPEAMENTO E DISPARO EM MASSA          -->
     <!-- =================================================================== -->
     <div id="abaCrm" class="hidden flex-1 overflow-y-auto p-6">
       <div class="max-w-7xl mx-auto space-y-6">
 
-        <!-- GRID SUPERIOR: IMPORTAR PLANILHA + TEMPLATES + DISPARADOR -->
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
-          <!-- CARD 1: IMPORTAR PLANILHA -->
+          <!-- CARD 1: IMPORTAR PLANILHA COM PREVIEW -->
           <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col justify-between">
             <div>
               <span class="text-[11px] font-bold uppercase tracking-wider text-emerald-600">Passo 1 • Base de Leads</span>
               <h3 class="text-base font-bold text-slate-800 mt-1">Importar Planilha de Contatos</h3>
               <p class="text-xs text-slate-500 mt-1 leading-relaxed">
-                Envie um arquivo <strong>.xlsx</strong> ou <strong>.csv</strong> contendo as colunas:<br>
-                <code class="bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">CNPJ, Nome, Razao Social, Telefone, Celular</code>
+                Selecione uma planilha <strong>.xlsx</strong> ou <strong>.csv</strong> para visualizar os dados e vincular cada coluna ao campo do CRM.
               </p>
             </div>
             <div class="mt-4 space-y-3">
-              <input type="file" id="inputPlanilhaLeads" accept=".xlsx,.csv" class="block w-full text-xs text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-slate-100 file:text-slate-700 hover:file:bg-slate-200" />
-              <button onclick="importarPlanilha()" class="w-full bg-slate-900 hover:bg-slate-800 text-white font-semibold py-2.5 rounded-xl text-xs transition">
-                Importar para Tabela CRM
+              <input type="file" id="inputPlanilhaLeads" accept=".xlsx,.xlsm,.csv,.txt"
+                     onchange="abrirPreviewPlanilha()"
+                     class="block w-full text-xs text-slate-500 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-emerald-50 file:text-emerald-700 hover:file:bg-emerald-100 cursor-pointer" />
+              <button onclick="abrirPreviewPlanilha()" class="w-full bg-slate-900 hover:bg-slate-800 text-white font-semibold py-2.5 rounded-xl text-xs transition">
+                Visualizar Planilha e Mapear Colunas
               </button>
-              <p id="resumoImportacao" class="text-xs text-emerald-700 font-medium hidden"></p>
+              <div id="resumoImportacao" class="hidden bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl p-2.5 text-xs font-medium"></div>
             </div>
           </div>
 
@@ -1545,7 +1701,7 @@ HTML_PAINEL = """
               <span class="text-[11px] font-bold uppercase tracking-wider text-blue-600">Passo 2 • Mensagem Cadastrada</span>
               <h3 class="text-base font-bold text-slate-800 mt-1">Templates de Abordagem</h3>
               <p class="text-[11px] text-slate-500 mt-1">
-                Variáveis disponíveis: <code>{nome}</code>, <code>{razao_social}</code>, <code>{cnpj}</code>, <code>{celular}</code>
+                Variáveis: <code>{nome}</code>, <code>{razao_social}</code>, <code>{cnpj}</code>, <code>{celular}</code>
               </p>
               <div class="mt-3 space-y-2">
                 <input id="tplTitulo" type="text" placeholder="Título da campanha (ex: Prospecção Edital)"
@@ -1632,7 +1788,6 @@ HTML_PAINEL = """
           </p>
         </div>
 
-        <!-- CARD TOGGLE LARANJA SUAVE -->
         <div class="bg-orange-50/70 border border-orange-200/80 rounded-2xl p-5 flex items-center justify-between gap-4">
           <div class="flex-1 text-center">
             <h3 class="text-sm font-bold text-orange-700">Habilitar atraso anti-spam</h3>
@@ -1646,7 +1801,6 @@ HTML_PAINEL = """
           </label>
         </div>
 
-        <!-- CARD COMO FUNCIONA AZUL SUAVE -->
         <div class="bg-sky-50/70 border border-sky-200/80 rounded-2xl p-5">
           <div class="flex items-center gap-2 text-sm font-bold text-slate-800">
             <span>💡</span>
@@ -1657,7 +1811,6 @@ HTML_PAINEL = """
           </p>
         </div>
 
-        <!-- INPUTS DE CONFIGURAÇÃO -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
           <div>
             <label class="block text-sm font-bold text-slate-800 mb-1.5">Limite de mensagens</label>
@@ -1681,22 +1834,17 @@ HTML_PAINEL = """
             <label class="block text-sm font-bold text-slate-800 mb-1.5">Atraso Mínimo (ms)</label>
             <input id="abMinMs" type="number" min="0" step="100" value="1000"
                    class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-600" />
-            <p class="text-xs text-slate-500 mt-1.5">
-              Atraso aleatório mínimo aplicado. 1000ms = 1 segundo.
-            </p>
+            <p class="text-xs text-slate-500 mt-1.5">Atraso aleatório mínimo aplicado. 1000ms = 1 segundo.</p>
           </div>
 
           <div>
             <label class="block text-sm font-bold text-slate-800 mb-1.5">Atraso Máximo (ms)</label>
             <input id="abMaxMs" type="number" min="0" step="100" value="3000"
                    class="w-full border border-slate-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-600" />
-            <p class="text-xs text-slate-500 mt-1.5">
-              Atraso aleatório máximo aplicado. 3000ms = 3 segundos.
-            </p>
+            <p class="text-xs text-slate-500 mt-1.5">Atraso aleatório máximo aplicado. 3000ms = 3 segundos.</p>
           </div>
         </div>
 
-        <!-- ALERTA RECOMENDAÇÃO -->
         <div class="bg-amber-50/80 border border-amber-200 rounded-xl px-4 py-3 text-xs text-slate-700 flex items-center gap-2">
           <span>⚠️</span>
           <span>Configurações seguras recomendadas: Limite 5, Janela 10s, Atraso 1000–3000ms. Para transmissões de grande volume, use Limite 3 com Atraso 2000–5000ms.</span>
@@ -1789,6 +1937,7 @@ HTML_PAINEL = """
     let PERFIS = [];
     let CHATS_CACHE = [];
     let LEADS_CACHE = [];
+    let PREVIEW_DATA = null;
     let JID_ATUAL = null;
     let intervalo = null;
     let mediaRecorder = null;
@@ -1990,28 +2139,141 @@ HTML_PAINEL = """
       carregarUsuarios();
     }
 
-    // --- CRM LEADS, TEMPLATES E DISPARO ---
-    async function importarPlanilha() {
+    // --- PREVIEW E MAPEAMENTO DE PLANILHA ---
+    function autoDetectarColuna(colunas, palavrasChave) {
+      for (let i = 0; i < colunas.length; i++) {
+        const norm = colunas[i].toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+        if (palavrasChave.some(p => norm === p || norm.includes(p))) {
+          return String(i);
+        }
+      }
+      return "-1";
+    }
+
+    async function abrirPreviewPlanilha() {
       const input = document.getElementById("inputPlanilhaLeads");
-      if (!input.files.length) return alert("Selecione uma planilha .xlsx ou .csv");
+      if (!input.files.length) return alert("Selecione uma planilha .xlsx ou .csv primeiro.");
+
       const formData = new FormData();
       formData.append("arquivo", input.files[0]);
 
-      const res = await fetch("/api/admin/leads/importar", {
-        method: "POST", headers: authHeaders(false), body: formData
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const resumo = document.getElementById("resumoImportacao");
-        resumo.innerText = `✅ Importados: ${data.importados} contatos | Ignorados (sem telefone válido): ${data.ignorados}`;
-        resumo.classList.remove("hidden");
-        input.value = "";
-        carregarLeads();
-      } else {
-        alert("Erro ao processar planilha.");
+      try {
+        const res = await fetch("/api/admin/leads/preview", {
+          method: "POST",
+          headers: authHeaders(false),
+          body: formData
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          return alert(err.detail || "Não foi possível ler a planilha. Verifique o formato.");
+        }
+
+        PREVIEW_DATA = await res.json();
+        document.getElementById("prevNomeArquivo").innerText = PREVIEW_DATA.filename;
+        document.getElementById("prevTotalLinhas").innerText = PREVIEW_DATA.total_linhas;
+
+        const opcoes = `<option value="-1">-- Não importar --</option>` +
+          PREVIEW_DATA.colunas.map((c, idx) => `<option value="${idx}">${c}</option>`).join("");
+
+        ["mapColCnpj", "mapColRazao", "mapColNome", "mapColCelular", "mapColTelefone"].forEach(id => {
+          document.getElementById(id).innerHTML = opcoes;
+        });
+
+        // Auto-vincula se encontrar nomes parecidos
+        document.getElementById("mapColCnpj").value = autoDetectarColuna(PREVIEW_DATA.colunas, ["cnpj", "documento"]);
+        document.getElementById("mapColRazao").value = autoDetectarColuna(PREVIEW_DATA.colunas, ["razao", "empresa", "fantasia"]);
+        document.getElementById("mapColNome").value = autoDetectarColuna(PREVIEW_DATA.colunas, ["nome", "contato", "socio", "responsavel"]);
+        document.getElementById("mapColCelular").value = autoDetectarColuna(PREVIEW_DATA.colunas, ["celular", "whatsapp", "cel", "movel"]);
+        document.getElementById("mapColTelefone").value = autoDetectarColuna(PREVIEW_DATA.colunas, ["telefone", "fone", "tel"]);
+
+        atualizarHighlightPreview();
+        document.getElementById("modalPreviewPlanilha").classList.remove("hidden");
+      } catch (e) {
+        alert("Erro de comunicação ao ler a planilha: " + e.message);
       }
     }
 
+    function atualizarHighlightPreview() {
+      if (!PREVIEW_DATA) return;
+      const mapaSelecionado = {
+        [document.getElementById("mapColCnpj").value]: "CNPJ",
+        [document.getElementById("mapColRazao").value]: "RAZÃO SOCIAL",
+        [document.getElementById("mapColNome").value]: "NOME",
+        [document.getElementById("mapColCelular").value]: "CELULAR",
+        [document.getElementById("mapColTelefone").value]: "TELEFONE",
+      };
+
+      document.getElementById("prevTableHead").innerHTML = `<tr>` +
+        PREVIEW_DATA.colunas.map((col, idx) => {
+          const tag = mapaSelecionado[String(idx)];
+          return `
+            <th class="px-4 py-3 ${tag ? 'bg-emerald-50 text-emerald-900 border-b-2 border-emerald-500' : ''}">
+              <div>${col}</div>
+              ${tag ? `<span class="inline-block mt-1 text-[10px] bg-emerald-600 text-white px-2 py-0.5 rounded-full">→ ${tag}</span>` : `<span class="inline-block mt-1 text-[10px] text-slate-400">Ignorada</span>`}
+            </th>
+          `;
+        }).join("") + `</tr>`;
+
+      document.getElementById("prevTableBody").innerHTML = PREVIEW_DATA.preview.map(row => `
+        <tr class="hover:bg-slate-50">
+          ${PREVIEW_DATA.colunas.map((_, idx) => {
+            const vinculado = Boolean(mapaSelecionado[String(idx)]);
+            return `<td class="px-4 py-2.5 ${vinculado ? 'bg-emerald-50/30 font-medium text-slate-900' : 'text-slate-400'}">${row[idx] || '-'}</td>`;
+          }).join("")}
+        </tr>
+      `).join("");
+    }
+
+    function fecharModalPreview() {
+      document.getElementById("modalPreviewPlanilha").classList.add("hidden");
+    }
+
+    async function confirmarImportacaoMapeada() {
+      const input = document.getElementById("inputPlanilhaLeads");
+      if (!input.files.length) return;
+
+      const colCel = document.getElementById("mapColCelular").value;
+      const colTel = document.getElementById("mapColTelefone").value;
+      if (colCel === "-1" && colTel === "-1") {
+        return alert("Vincule pelo menos a coluna de Celular ou Telefone antes de importar.");
+      }
+
+      const btn = document.getElementById("btnConfirmarImportacao");
+      btn.disabled = true;
+      btn.innerText = "Importando registros...";
+
+      const formData = new FormData();
+      formData.append("arquivo", input.files[0]);
+      formData.append("col_cnpj", document.getElementById("mapColCnpj").value);
+      formData.append("col_razao", document.getElementById("mapColRazao").value);
+      formData.append("col_nome", document.getElementById("mapColNome").value);
+      formData.append("col_celular", colCel);
+      formData.append("col_telefone", colTel);
+
+      try {
+        const res = await fetch("/api/admin/leads/importar-mapeado", {
+          method: "POST",
+          headers: authHeaders(false),
+          body: formData
+        });
+        const data = await res.json();
+        if (res.ok) {
+          fecharModalPreview();
+          input.value = "";
+          const resumo = document.getElementById("resumoImportacao");
+          resumo.innerHTML = `✅ Importação concluída! <strong>${data.importados}</strong> leads gravados no CRM (${data.ignorados} linhas sem telefone válido ignoradas).`;
+          resumo.classList.remove("hidden");
+          await carregarLeads();
+        } else {
+          alert(data.detail || "Erro ao importar os dados.");
+        }
+      } finally {
+        btn.disabled = false;
+        btn.innerText = "Confirmar e Importar Leads";
+      }
+    }
+
+    // --- CRM LEADS, TEMPLATES E DISPARO ---
     async function carregarLeads() {
       const res = await fetch("/api/admin/leads", { headers: authHeaders() });
       if (!res.ok) return;
