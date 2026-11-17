@@ -5,3 +5,4 @@ pymysql
 cryptography
 python-multipart
 imageio-ffmpeg
+openpyxl
