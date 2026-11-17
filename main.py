@@ -2,58 +2,52 @@ import os
 import re
 import io
 import csv
-import time
 import uuid
-import random
-import asyncio
 import hashlib
-import secrets
 import logging
+import asyncio
+import random
 import subprocess
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional, List, Dict, Any
 
 import httpx
 import psycopg2
 import psycopg2.extras
 import openpyxl
-import imageio_ffmpeg
-from fastapi import FastAPI, Request, BackgroundTasks, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("tottem-atendimento")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("tottem-omnidesk")
 
-app = FastAPI(title="Tottem OmniDesk — Atendimento & Prospecção Supabase")
+app = FastAPI(title="Tottem OmniDesk — Atendimento & Prospecção (Supabase)")
 
 # ==============================================================================
-# VARIÁVEIS DE AMBIENTE (RENDER -> SUPABASE POSTGRESQL)
+# DIRETÓRIO DE MÍDIAS LOCAIS
 # ==============================================================================
-WA_BASE_URL = os.getenv("WA_BASE_URL", "https://zap.tottemtecnologia.com.br/api").rstrip("/")
-SESSION_ID = os.getenv("SESSION_ID", "")
-API_KEY = os.getenv("API_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@tottemtecnologia.com.br")
-ADMIN_SENHA = os.getenv("ADMIN_SENHA", "tottem2026")
-
-HEADERS_WA = {"X-API-Key": API_KEY}
-HEADERS_WA_JSON = {"Content-Type": "application/json", "X-API-Key": API_KEY}
-
 MEDIA_DIR = Path("media_files")
-MEDIA_DIR.mkdir(exist_ok=True)
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
-RATE_LIMIT_STATE = {
-    "window_start": 0.0,
-    "count": 0,
-    "lock": asyncio.Lock(),
-}
+# ==============================================================================
+# CONFIGURAÇÕES (VARIÁVEIS DE AMBIENTE)
+# ==============================================================================
+WA_BASE_URL = os.getenv("WA_BASE_URL", "https://wa-akg-v13p.onrender.com").rstrip("/")
+SESSION_ID = os.getenv("SESSION_ID", "sessao_principal")
+API_KEY = os.getenv("API_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+ADMIN_EMAIL_DEFAULT = os.getenv("ADMIN_EMAIL", "admin@tottemtecnologia.com.br")
+ADMIN_SENHA_DEFAULT = os.getenv("ADMIN_SENHA", "tottem2026")
 
+# Controle em memória do Anti-Banimento e Campanha de Disparo em Massa
+HISTORICO_ENVIOS_TS = deque()
 CAMPANHA_STATUS = {
     "em_execucao": False,
+    "cancelar": False,
     "total": 0,
     "enviados": 0,
     "falhas": 0,
@@ -61,583 +55,8 @@ CAMPANHA_STATUS = {
     "mensagem_status": "Pronto para iniciar disparos.",
 }
 
-
 # ==============================================================================
-# SEGURANÇA, NORMALIZAÇÃO DE TELEFONE/CNPJ E ÁUDIO OGG/OPUS
-# ==============================================================================
-def hash_senha(senha: str) -> str:
-    return hashlib.sha256(senha.encode("utf-8")).hexdigest()
-
-
-def limpar_digitos(valor: Any) -> str:
-    return re.sub(r"\D", "", str(valor or ""))
-
-
-def converter_para_ogg(origem: Path) -> Path:
-    destino_ogg = origem.with_suffix(".ogg")
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    cmd = [
-        ffmpeg_exe, "-y", "-i", str(origem),
-        "-vn", "-c:a", "libopus", "-ar", "16000", "-ac", "1", "-b:a", "24k",
-        str(destino_ogg)
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    return destino_ogg
-
-
-def normalizar_numero_wa(celular: str, telefone: str = "") -> Optional[str]:
-    """Prioriza celular; se vazio, usa telefone. Retorna JID formatado (55...)."""
-    for bruto in (celular, telefone):
-        digitos = limpar_digitos(bruto)
-        if digitos.startswith("0"):
-            digitos = digitos.lstrip("0")
-        if len(digitos) >= 10:
-            if not digitos.startswith("55") and len(digitos) in (10, 11):
-                digitos = "55" + digitos
-            return f"{digitos}@s.whatsapp.net"
-    return None
-
-
-def extrair_jids_contato(contato: Dict[str, Any], enviar_ambos: bool = False) -> List[str]:
-    """Retorna a lista de JIDs únicos do contato conforme a opção de enviar para ambos os números."""
-    jid_cel = normalizar_numero_wa(contato.get("celular", ""))
-    jid_tel = normalizar_numero_wa(contato.get("telefone", ""))
-
-    if not enviar_ambos:
-        principal = jid_cel or jid_tel or contato.get("jid")
-        return [principal] if principal else []
-
-    jids: List[str] = []
-    for j in (jid_cel, jid_tel, contato.get("jid")):
-        if j and j not in jids:
-            jids.append(j)
-            if not jid_cel or not jid_tel:
-                break
-    return jids
-
-
-def aplicar_variaveis_template(template: str, contato: Dict[str, Any]) -> str:
-    texto = template
-    mapa = {
-        "{nome}": contato.get("nome") or contato.get("razao_social") or "Cliente",
-        "{razao_social}": contato.get("razao_social") or contato.get("nome") or "",
-        "{cnpj}": contato.get("cnpj") or "",
-        "{telefone}": contato.get("telefone") or "",
-        "{celular}": contato.get("celular") or "",
-    }
-    for chave, valor in mapa.items():
-        texto = texto.replace(chave, str(valor))
-    return texto
-
-
-def ler_planilha_bruta(conteudo: bytes, filename: str) -> Dict[str, Any]:
-    """Lê .xlsx, .xlsm ou .csv com detecção automática de encoding e delimitador."""
-    nome_arq = (filename or "").lower()
-    colunas: List[str] = []
-    linhas: List[List[str]] = []
-
-    if nome_arq.endswith((".xlsx", ".xlsm")):
-        wb = openpyxl.load_workbook(io.BytesIO(conteudo), data_only=True, read_only=True)
-        ws = wb.active
-        rows_iter = ws.iter_rows(values_only=True)
-        header_row = next(rows_iter, None)
-        if not header_row:
-            raise HTTPException(status_code=400, detail="Planilha Excel está vazia.")
-
-        colunas = [
-            str(c).strip() if c is not None and str(c).strip() else f"Coluna_{idx+1}"
-            for idx, c in enumerate(header_row)
-        ]
-        for r in rows_iter:
-            if not any(cell is not None and str(cell).strip() != "" for cell in r):
-                continue
-            linha_str = [str(r[i]).strip() if i < len(r) and r[i] is not None else "" for i in range(len(colunas))]
-            linhas.append(linha_str)
-    else:
-        texto_csv = None
-        for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
-            try:
-                texto_csv = conteudo.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        if texto_csv is None:
-            texto_csv = conteudo.decode("utf-8", errors="ignore")
-
-        linhas_raw = [l for l in texto_csv.splitlines() if l.strip()]
-        if not linhas_raw:
-            raise HTTPException(status_code=400, detail="Arquivo CSV está vazio.")
-
-        primeira = linhas_raw[0]
-        delimitador = ";" if primeira.count(";") >= primeira.count(",") else ","
-        if "\t" in primeira and primeira.count("\t") > primeira.count(delimitador):
-            delimitador = "\t"
-
-        reader = csv.reader(io.StringIO("\n".join(linhas_raw)), delimiter=delimitador)
-        header_row = next(reader, None)
-        if not header_row:
-            raise HTTPException(status_code=400, detail="Cabeçalho CSV não encontrado.")
-
-        colunas = [
-            str(c).strip() if c and str(c).strip() else f"Coluna_{idx+1}"
-            for idx, c in enumerate(header_row)
-        ]
-        for r in reader:
-            if not any(cell and str(cell).strip() != "" for cell in r):
-                continue
-            linha_str = [str(r[i]).strip() if i < len(r) and r[i] is not None else "" for i in range(len(colunas))]
-            linhas.append(linha_str)
-
-    return {"colunas": colunas, "linhas": linhas}
-
-
-# ==============================================================================
-# BANCO DE DADOS POSTGRESQL (SUPABASE)
-# ==============================================================================
-def get_db_connection():
-    if not DATABASE_URL:
-        raise RuntimeError("Variável DATABASE_URL não configurada.")
-    conn = psycopg2.connect(
-        DATABASE_URL,
-        sslmode="require",
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    )
-    conn.autocommit = True
-    return conn
-
-
-def init_db():
-    """Cria apenas as tabelas exclusivas do OmniDesk, mantendo clientes e pessoas intactas."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS perfis_atendimento (
-                    id SERIAL PRIMARY KEY,
-                    codigo VARCHAR(30) UNIQUE NOT NULL,
-                    nome VARCHAR(100) NOT NULL,
-                    opcao_menu VARCHAR(10) NOT NULL,
-                    descricao VARCHAR(255) DEFAULT '',
-                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS usuarios_painel (
-                    id SERIAL PRIMARY KEY,
-                    nome VARCHAR(120) NOT NULL,
-                    email VARCHAR(150) UNIQUE NOT NULL,
-                    senha_hash VARCHAR(255) NOT NULL,
-                    role VARCHAR(20) DEFAULT 'ATENDENTE',
-                    perfil_id INT NULL REFERENCES perfis_atendimento(id) ON DELETE SET NULL,
-                    token_sessao VARCHAR(120) NULL,
-                    ativo SMALLINT DEFAULT 1,
-                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS atendimentos (
-                    jid VARCHAR(100) PRIMARY KEY,
-                    nome VARCHAR(150) DEFAULT '',
-                    setor VARCHAR(30) DEFAULT 'TRIAGEM',
-                    status VARCHAR(30) DEFAULT 'TRIAGEM',
-                    ultima_mensagem TEXT,
-                    notas_crm TEXT,
-                    nao_lidas INT DEFAULT 0,
-                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS mensagens_atendimento (
-                    id SERIAL PRIMARY KEY,
-                    jid VARCHAR(100) NOT NULL,
-                    remetente VARCHAR(80) NOT NULL,
-                    conteudo TEXT NOT NULL,
-                    tipo_midia VARCHAR(20) DEFAULT 'TEXT',
-                    url_midia VARCHAR(255) NULL,
-                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_jid ON mensagens_atendimento(jid);")
-
-            # Tabela dedicada aos contatos importados para disparo (separada de clientes e pessoas)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS contatos_importados (
-                    id SERIAL PRIMARY KEY,
-                    cnpj VARCHAR(30) DEFAULT '',
-                    nome VARCHAR(180) DEFAULT '',
-                    razao_social VARCHAR(220) DEFAULT '',
-                    telefone VARCHAR(40) DEFAULT '',
-                    celular VARCHAR(40) DEFAULT '',
-                    jid VARCHAR(100) UNIQUE NOT NULL,
-                    status_contato VARCHAR(30) DEFAULT 'nao_enviado',
-                    origem VARCHAR(100) DEFAULT 'PLANILHA',
-                    ultimo_disparo TIMESTAMP NULL,
-                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_contatos_imp_cnpj ON contatos_importados(cnpj);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_contatos_imp_status ON contatos_importados(status_contato);")
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS templates_disparo (
-                    id SERIAL PRIMARY KEY,
-                    titulo VARCHAR(120) NOT NULL,
-                    conteudo TEXT NOT NULL,
-                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS config_antiban (
-                    id INT PRIMARY KEY,
-                    habilitado SMALLINT DEFAULT 1,
-                    limite_mensagens INT DEFAULT 5,
-                    janela_segundos INT DEFAULT 10,
-                    atraso_min_ms INT DEFAULT 1000,
-                    atraso_max_ms INT DEFAULT 3000,
-                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-
-            cur.execute("""
-                INSERT INTO config_antiban
-                    (id, habilitado, limite_mensagens, janela_segundos, atraso_min_ms, atraso_max_ms)
-                VALUES (1, 1, 5, 10, 1000, 3000)
-                ON CONFLICT (id) DO NOTHING;
-            """)
-
-            cur.execute("""
-                INSERT INTO templates_disparo (id, titulo, conteudo)
-                VALUES (
-                    1,
-                    'Apresentação Comercial B2B',
-                    E'Olá *{nome}* da empresa *{razao_social}* (CNPJ: {cnpj})! 👋\n\nSomos da *Tottem Tecnologia* e gostaríamos de apresentar nossas soluções para impulsionar seus resultados. Podemos conversar?'
-                )
-                ON CONFLICT (id) DO NOTHING;
-            """)
-            cur.execute("SELECT setval(pg_get_serial_sequence('templates_disparo', 'id'), COALESCE((SELECT MAX(id) FROM templates_disparo), 1), true);")
-
-            cur.execute("""
-                INSERT INTO perfis_atendimento (codigo, nome, opcao_menu, descricao)
-                VALUES
-                    ('SUPORTE', 'Suporte Técnico', '1', 'Atendimento técnico e chamados'),
-                    ('COMERCIAL', 'Comercial e Orçamentos', '2', 'Vendas, propostas e licitações')
-                ON CONFLICT (codigo) DO NOTHING;
-            """)
-
-            cur.execute("SELECT id FROM usuarios_painel WHERE email = %s", (ADMIN_EMAIL,))
-            if not cur.fetchone():
-                cur.execute(
-                    """
-                    INSERT INTO usuarios_painel (nome, email, senha_hash, role, perfil_id)
-                    VALUES (%s, %s, %s, 'ADMIN', NULL)
-                    """,
-                    ("Administrador", ADMIN_EMAIL, hash_senha(ADMIN_SENHA)),
-                )
-        logger.info("Banco de dados Supabase (OmniDesk) sincronizado sem alterar tabelas existentes.")
-    finally:
-        conn.close()
-
-
-@app.on_event("startup")
-def on_startup():
-    if DATABASE_URL:
-        init_db()
-
-
-# ==============================================================================
-# MOTOR DE PROTEÇÃO ANTI-BANIMENTO
-# ==============================================================================
-def obter_config_antiban_db() -> Dict[str, Any]:
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM config_antiban WHERE id = 1")
-            cfg = cur.fetchone()
-            return dict(cfg) if cfg else {
-                "habilitado": 1,
-                "limite_mensagens": 5,
-                "janela_segundos": 10,
-                "atraso_min_ms": 1000,
-                "atraso_max_ms": 3000,
-            }
-    finally:
-        conn.close()
-
-
-async def aguardar_protecao_antiban():
-    cfg = obter_config_antiban_db()
-    if not cfg.get("habilitado"):
-        return
-
-    limite = max(1, int(cfg.get("limite_mensagens") or 5))
-    janela = max(1, int(cfg.get("janela_segundos") or 10))
-    min_ms = max(0, int(cfg.get("atraso_min_ms") or 1000))
-    max_ms = max(min_ms, int(cfg.get("atraso_max_ms") or 3000))
-
-    delay_segundos = 0.0
-    async with RATE_LIMIT_STATE["lock"]:
-        agora = time.monotonic()
-        if agora - RATE_LIMIT_STATE["window_start"] >= janela:
-            RATE_LIMIT_STATE["window_start"] = agora
-            RATE_LIMIT_STATE["count"] = 0
-
-        RATE_LIMIT_STATE["count"] += 1
-        if RATE_LIMIT_STATE["count"] > limite:
-            delay_ms = random.randint(min_ms, max_ms)
-            delay_segundos = delay_ms / 1000.0
-
-    if delay_segundos > 0:
-        logger.info(f"[Anti-Ban] Limite ({limite} msgs/{janela}s) atingido. Aguardando {delay_segundos:.2f}s...")
-        await asyncio.sleep(delay_segundos)
-
-
-# ==============================================================================
-# INTEGRAÇÃO WA-AKG
-# ==============================================================================
-async def enviar_texto_wa(jid: str, texto: str) -> bool:
-    await aguardar_protecao_antiban()
-    url = f"{WA_BASE_URL}/messages/{SESSION_ID}/{jid}/send"
-    payload = {"message": {"text": texto}}
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            resp = await client.post(url, json=payload, headers=HEADERS_WA_JSON)
-            if resp.status_code not in (200, 201):
-                logger.error(f"Falha envio WA [{resp.status_code}]: {resp.text[:200]}")
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"Erro envio texto WA: {e}")
-            return False
-
-
-async def enviar_midia_wa(jid: str, file_path: Path, filename: str, media_type: str, caption: str = "") -> bool:
-    await aguardar_protecao_antiban()
-    url = f"{WA_BASE_URL}/messages/{SESSION_ID}/{jid}/media"
-    mime_map = {
-        "audio": "audio/ogg; codecs=opus",
-        "voice": "audio/ogg; codecs=opus",
-        "image": "image/jpeg",
-        "video": "video/mp4",
-        "document": "application/pdf",
-    }
-    mime = mime_map.get(media_type, "application/octet-stream")
-
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        try:
-            with open(file_path, "rb") as f:
-                files = {"file": (filename, f, mime)}
-                tipo_api = "voice" if media_type in {"audio", "voice"} else media_type
-                data = {"type": tipo_api, "caption": caption}
-                resp = await client.post(url, headers=HEADERS_WA, files=files, data=data)
-                return resp.status_code in (200, 201)
-        except Exception as e:
-            logger.error(f"Erro envio mídia WA: {e}")
-            return False
-
-
-async def baixar_midia_wa(data: Dict[str, Any], key: Dict[str, Any], tipo: str) -> Optional[str]:
-    ext_map = {
-        "IMAGE": ".jpg",
-        "AUDIO": ".ogg",
-        "VOICE": ".ogg",
-        "VIDEO": ".mp4",
-        "DOCUMENT": ".pdf",
-        "STICKER": ".webp",
-    }
-    ext = ext_map.get(tipo.upper(), ".bin")
-    file_url = data.get("fileUrl")
-    urls_tentativa: List[str] = []
-
-    if file_url:
-        if file_url.startswith("http"):
-            urls_tentativa.append(file_url)
-        else:
-            base_host = WA_BASE_URL.replace("/api", "")
-            urls_tentativa.append(f"{base_host}{file_url if file_url.startswith('/') else '/' + file_url}")
-
-    for mid in [data.get("id"), key.get("id")]:
-        if mid:
-            urls_tentativa.append(f"{WA_BASE_URL}/messages/{SESSION_ID}/download/{mid}/media")
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for url in urls_tentativa:
-            try:
-                resp = await client.get(url, headers=HEADERS_WA, follow_redirects=True)
-                if resp.status_code == 200 and len(resp.content) > 100:
-                    nome_arquivo = f"in_{uuid.uuid4().hex}{ext}"
-                    destino = MEDIA_DIR / nome_arquivo
-                    destino.write_bytes(resp.content)
-                    return f"/media/{nome_arquivo}"
-            except Exception as e:
-                logger.error(f"Erro download mídia {url}: {e}")
-    return None
-
-
-def registrar_mensagem(
-    jid: str,
-    remetente: str,
-    conteudo: str,
-    nome: str = "",
-    incrementar_nao_lidas: bool = False,
-    tipo_midia: str = "TEXT",
-    url_midia: Optional[str] = None,
-    setor_padrao: Optional[str] = None,
-    status_padrao: Optional[str] = None,
-):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO mensagens_atendimento (jid, remetente, conteudo, tipo_midia, url_midia)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (jid, remetente, conteudo, tipo_midia, url_midia),
-            )
-            inc = 1 if incrementar_nao_lidas else 0
-            resumo = conteudo if conteudo else f"[{tipo_midia}]"
-            setor_ins = setor_padrao or "TRIAGEM"
-            status_ins = status_padrao or "TRIAGEM"
-            cur.execute("""
-                INSERT INTO atendimentos (jid, nome, setor, status, ultima_mensagem, nao_lidas, atualizado_em)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (jid) DO UPDATE SET
-                    nome = CASE WHEN EXCLUDED.nome != '' THEN EXCLUDED.nome ELSE atendimentos.nome END,
-                    setor = COALESCE(%s, atendimentos.setor),
-                    status = COALESCE(%s, atendimentos.status),
-                    ultima_mensagem = EXCLUDED.ultima_mensagem,
-                    nao_lidas = atendimentos.nao_lidas + EXCLUDED.nao_lidas,
-                    atualizado_em = NOW()
-            """, (
-                jid, nome, setor_ins, status_ins, resumo, inc,
-                setor_padrao, status_padrao
-            ))
-    finally:
-        conn.close()
-
-
-# ==============================================================================
-# WEBHOOK DE RECEBIMENTO
-# ==============================================================================
-async def processar_webhook(payload: Dict[str, Any]) -> None:
-    try:
-        evento = payload.get("event", "")
-        if evento and evento not in {"message.received", "messages.upsert"}:
-            return
-
-        data = payload.get("data", payload)
-        key = data.get("key", {})
-        message_obj = data.get("message", {})
-
-        if key.get("fromMe", data.get("fromMe", False)):
-            return
-
-        jid: Optional[str] = key.get("remoteJid") or data.get("remoteJid") or data.get("from")
-        if not jid or "@g.us" in jid or "status@broadcast" in jid:
-            return
-        if "@" not in jid:
-            jid = f"{jid}@s.whatsapp.net"
-
-        push_name = data.get("pushName") or payload.get("pushName") or jid.split("@")[0]
-        msg_type = (data.get("type") or "TEXT").upper()
-
-        texto = (
-            message_obj.get("conversation")
-            or message_obj.get("extendedTextMessage", {}).get("text")
-            or data.get("content")
-            or data.get("text")
-            or data.get("body")
-            or ""
-        ).strip()
-
-        url_midia = None
-        if msg_type in {"IMAGE", "AUDIO", "VOICE", "VIDEO", "DOCUMENT", "STICKER"} or data.get("fileUrl"):
-            url_midia = await baixar_midia_wa(data, key, msg_type)
-            if not texto:
-                texto = f"Mídia recebida ({msg_type})"
-        else:
-            msg_type = "TEXT"
-
-        if not texto and not url_midia:
-            return
-
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM atendimentos WHERE jid = %s", (jid,))
-                atendimento = cur.fetchone()
-                cur.execute("SELECT * FROM perfis_atendimento ORDER BY opcao_menu ASC")
-                perfis = cur.fetchall()
-                cur.execute("SELECT * FROM contatos_importados WHERE jid = %s", (jid,))
-                contato = cur.fetchone()
-        finally:
-            conn.close()
-
-        nome_exibicao = (contato["nome"] or contato["razao_social"]) if contato else push_name
-        status_atual = atendimento["status"] if atendimento else "TRIAGEM"
-
-        registrar_mensagem(
-            jid=jid,
-            remetente="CLIENTE",
-            conteudo=texto,
-            nome=nome_exibicao,
-            incrementar_nao_lidas=(status_atual == "EM_ATENDIMENTO"),
-            tipo_midia=msg_type,
-            url_midia=url_midia,
-        )
-
-        if status_atual == "EM_ATENDIMENTO" and texto.lower() not in {"#menu", "#sair"}:
-            return
-
-        perfil_escolhido = next((p for p in perfis if p["opcao_menu"].strip() == texto), None)
-
-        if perfil_escolhido:
-            codigo_setor = perfil_escolhido["codigo"]
-            nome_setor = perfil_escolhido["nome"]
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE atendimentos SET setor = %s, status = 'EM_ATENDIMENTO', nao_lidas = 1 WHERE jid = %s",
-                        (codigo_setor, jid),
-                    )
-            finally:
-                conn.close()
-
-            resp_msg = (
-                f"✅ Você foi direcionado para *{nome_setor}*.\n"
-                "Pode enviar sua mensagem, áudio ou anexo que nossa equipe já vai lhe atender."
-            )
-            await enviar_texto_wa(jid, resp_msg)
-            registrar_mensagem(jid, "BOT", resp_msg)
-        else:
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE atendimentos SET setor = 'TRIAGEM', status = 'TRIAGEM' WHERE jid = %s",
-                        (jid,),
-                    )
-            finally:
-                conn.close()
-
-            linhas_opcoes = "\n".join([f"*{p['opcao_menu']}* - {p['nome']}" for p in perfis])
-            menu = (
-                f"Olá, *{nome_exibicao}*! Bem-vindo à *Tottem Tecnologia*.\n\n"
-                f"Responda apenas com o número do departamento desejado:\n{linhas_opcoes}"
-            )
-            await enviar_texto_wa(jid, menu)
-            registrar_mensagem(jid, "BOT", menu)
-    except Exception as e:
-        logger.exception(f"Erro ao processar webhook: {e}")
-
-
-# ==============================================================================
-# MODELOS E ROTAS DA API
+# MODELOS PYDANTIC
 # ==============================================================================
 class LoginReq(BaseModel):
     email: str
@@ -648,7 +67,6 @@ class PerfilReq(BaseModel):
     codigo: str
     nome: str
     opcao_menu: str
-    descricao: str = ""
 
 
 class UsuarioReq(BaseModel):
@@ -670,12 +88,7 @@ class AcaoTicketReq(BaseModel):
     notas_crm: Optional[str] = None
 
 
-class TemplateReq(BaseModel):
-    titulo: str
-    conteudo: str
-
-
-class AntiBanReq(BaseModel):
+class ConfigAntiBanReq(BaseModel):
     habilitado: bool
     limite_mensagens: int
     janela_segundos: int
@@ -683,71 +96,595 @@ class AntiBanReq(BaseModel):
     atraso_max_ms: int
 
 
+class TemplateReq(BaseModel):
+    titulo: str
+    conteudo: str
+
+
 class DisparoMassaReq(BaseModel):
     template_id: int
     setor_destino: str
     status_filtro: str = "nao_enviado"
     enviar_ambos_numeros: bool = False
-    contato_ids: List[int] = []
+    contato_ids: Optional[List[int]] = None
+
+
+class AbrirConversaContatoReq(BaseModel):
+    contato_id: int
+    setor_destino: str = "COMERCIAL"
 
 
 class ExcluirMassaContatosReq(BaseModel):
     ids: List[int]
 
 
-class AlterarStatusContatoReq(BaseModel):
+class AtualizarStatusContatoReq(BaseModel):
     status_contato: str
 
 
-class IniciarChatContatoReq(BaseModel):
-    contato_id: int
-    setor_destino: str
+# ==============================================================================
+# UTILITÁRIOS DE TELEFONE, DOCUMENTO E HASH
+# ==============================================================================
+def hash_senha(senha: str) -> str:
+    return hashlib.sha256(senha.encode("utf-8")).hexdigest()
 
 
+def limpar_digitos(valor: Any) -> str:
+    if valor is None:
+        return ""
+    return re.sub(r"\D", "", str(valor))
+
+
+def normalizar_numero_wa(celular: str, telefone: str = "") -> str:
+    """Prioriza o celular e fallback para telefone, formatando para JID do WhatsApp."""
+    for bruto in (celular, telefone):
+        dig = limpar_digitos(bruto)
+        if not dig:
+            continue
+        if len(dig) in (10, 11):
+            dig = "55" + dig
+        if len(dig) >= 12:
+            return f"{dig}@s.whatsapp.net"
+    return ""
+
+
+def extrair_jids_contato(contato: Dict[str, Any], enviar_ambos: bool = False) -> List[str]:
+    """Retorna o(s) JID(s) do contato sem duplicar quando Celular e Telefone são iguais."""
+    jids: List[str] = []
+    jid_cel = normalizar_numero_wa(contato.get("celular") or "", "")
+    jid_tel = normalizar_numero_wa(contato.get("telefone") or "", "")
+
+    if jid_cel:
+        jids.append(jid_cel)
+        if enviar_ambos and jid_tel and jid_tel != jid_cel:
+            jids.append(jid_tel)
+    elif jid_tel:
+        jids.append(jid_tel)
+    elif contato.get("jid"):
+        jids.append(contato["jid"])
+
+    return jids
+
+
+def aplicar_variaveis_template(texto: str, contato: Dict[str, Any]) -> str:
+    nome = contato.get("nome") or contato.get("razao_social") or "Cliente"
+    razao = contato.get("razao_social") or nome
+    cnpj = contato.get("cnpj") or ""
+    celular = contato.get("celular") or contato.get("telefone") or ""
+
+    resultado = texto
+    resultado = resultado.replace("{nome}", nome)
+    resultado = resultado.replace("{razao_social}", razao)
+    resultado = resultado.replace("{cnpj}", cnpj)
+    resultado = resultado.replace("{celular}", celular)
+    return resultado
+
+
+# ==============================================================================
+# CONEXÃO SUPABASE (POSTGRESQL) E TABELAS EXCLUSIVAS DO OMNIDESK
+# ==============================================================================
+def get_db_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("A variável de ambiente DATABASE_URL (Supabase PostgreSQL) não está configurada.")
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        sslmode="require",
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+    conn.autocommit = True
+    return conn
+
+
+def init_db():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # 1. Perfis / Departamentos
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS perfis_atendimento (
+                    id SERIAL PRIMARY KEY,
+                    codigo VARCHAR(50) UNIQUE NOT NULL,
+                    nome VARCHAR(100) NOT NULL,
+                    opcao_menu VARCHAR(10) NOT NULL,
+                    ativo BOOLEAN DEFAULT TRUE
+                );
+            """)
+
+            # 2. Usuários do Painel OmniDesk
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS usuarios_painel (
+                    id SERIAL PRIMARY KEY,
+                    nome VARCHAR(120) NOT NULL,
+                    email VARCHAR(150) UNIQUE NOT NULL,
+                    senha_hash VARCHAR(255) NOT NULL,
+                    role VARCHAR(20) NOT NULL DEFAULT 'ATENDENTE',
+                    perfil_id INTEGER NULL REFERENCES perfis_atendimento(id) ON DELETE SET NULL,
+                    token_sessao VARCHAR(120) NULL,
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # 3. Contatos Importados (Isolada das tabelas 'clientes' e 'pessoas')
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS contatos_importados (
+                    id SERIAL PRIMARY KEY,
+                    cnpj VARCHAR(30) NULL,
+                    nome VARCHAR(160) NULL,
+                    razao_social VARCHAR(200) NULL,
+                    telefone VARCHAR(40) NULL,
+                    celular VARCHAR(40) NULL,
+                    jid VARCHAR(100) UNIQUE NOT NULL,
+                    status_contato VARCHAR(30) NOT NULL DEFAULT 'nao_enviado',
+                    origem VARCHAR(50) DEFAULT 'PLANILHA',
+                    ultimo_disparo TIMESTAMP NULL,
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # 4. Atendimentos / Tickets WhatsApp
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS atendimentos (
+                    jid VARCHAR(100) PRIMARY KEY,
+                    nome VARCHAR(150),
+                    setor VARCHAR(50) DEFAULT 'TRIAGEM',
+                    status VARCHAR(30) DEFAULT 'TRIAGEM',
+                    ultima_mensagem TEXT,
+                    nao_lidas INTEGER DEFAULT 0,
+                    notas_crm TEXT NULL,
+                    atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # 5. Histórico de Mensagens
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mensagens_atendimento (
+                    id SERIAL PRIMARY KEY,
+                    jid VARCHAR(100) NOT NULL,
+                    remetente VARCHAR(80) NOT NULL,
+                    conteudo TEXT NOT NULL,
+                    tipo_midia VARCHAR(20) DEFAULT 'TEXT',
+                    url_midia VARCHAR(255) NULL,
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # 6. Configuração Anti-Banimento
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS config_antiban (
+                    id INTEGER PRIMARY KEY,
+                    habilitado BOOLEAN DEFAULT TRUE,
+                    limite_mensagens INTEGER DEFAULT 5,
+                    janela_segundos INTEGER DEFAULT 10,
+                    atraso_min_ms INTEGER DEFAULT 1000,
+                    atraso_max_ms INTEGER DEFAULT 3000
+                );
+            """)
+
+            # 7. Templates de Campanha
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS templates_disparo (
+                    id SERIAL PRIMARY KEY,
+                    titulo VARCHAR(150) NOT NULL,
+                    conteudo TEXT NOT NULL,
+                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # Seeds iniciais idempotentes
+            cur.execute("SELECT COUNT(*) AS total FROM perfis_atendimento")
+            if cur.fetchone()["total"] == 0:
+                cur.execute(
+                    "INSERT INTO perfis_atendimento (codigo, nome, opcao_menu) VALUES (%s, %s, %s)",
+                    ("COMERCIAL", "Comercial & Vendas", "1"),
+                )
+                cur.execute(
+                    "INSERT INTO perfis_atendimento (codigo, nome, opcao_menu) VALUES (%s, %s, %s)",
+                    ("SUPORTE", "Suporte Técnico", "2"),
+                )
+
+            cur.execute("SELECT COUNT(*) AS total FROM usuarios_painel WHERE role = 'ADMIN'")
+            if cur.fetchone()["total"] == 0:
+                cur.execute(
+                    """
+                    INSERT INTO usuarios_painel (nome, email, senha_hash, role, perfil_id)
+                    VALUES (%s, %s, %s, 'ADMIN', NULL)
+                    """,
+                    ("Administrador Geral", ADMIN_EMAIL_DEFAULT, hash_senha(ADMIN_SENHA_DEFAULT)),
+                )
+
+            cur.execute("SELECT COUNT(*) AS total FROM config_antiban WHERE id = 1")
+            if cur.fetchone()["total"] == 0:
+                cur.execute("""
+                    INSERT INTO config_antiban (id, habilitado, limite_mensagens, janela_segundos, atraso_min_ms, atraso_max_ms)
+                    VALUES (1, TRUE, 5, 10, 1000, 3000)
+                """)
+
+            cur.execute("SELECT COUNT(*) AS total FROM templates_disparo")
+            if cur.fetchone()["total"] == 0:
+                cur.execute(
+                    "INSERT INTO templates_disparo (titulo, conteudo) VALUES (%s, %s)",
+                    (
+                        "Apresentação Comercial — Automação de Licitações",
+                        "Olá *{nome}* da *{razao_social}*, tudo bem? 👋\n\nAqui é da *Tottem Tecnologia*. Vimos que vocês atuam com vendas para o governo e gostaríamos de mostrar como automatizar lances e propostas no Compras.gov e PNCP.\n\nPosso te enviar uma demonstração rápida?",
+                    ),
+                )
+
+        logger.info("Banco de dados Supabase (OmniDesk) sincronizado sem alterar tabelas existentes.")
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+# ==============================================================================
+# AUTENTICAÇÃO E PERMISSÕES
+# ==============================================================================
 def obter_usuario_atual(request: Request) -> Dict[str, Any]:
-    token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
-    if not token:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Não autenticado")
+    token = auth.replace("Bearer ", "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Token inválido")
 
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT u.id, u.nome, u.email, u.role, u.perfil_id,
                        p.codigo AS perfil_codigo, p.nome AS perfil_nome
                 FROM usuarios_painel u
                 LEFT JOIN perfis_atendimento p ON u.perfil_id = p.id
-                WHERE u.token_sessao = %s AND u.ativo = 1
-            """, (token,))
+                WHERE u.token_sessao = %s
+                """,
+                (token,),
+            )
             user = cur.fetchone()
             if not user:
-                raise HTTPException(status_code=401, detail="Sessão inválida")
+                raise HTTPException(status_code=401, detail="Sessão expirada")
             return dict(user)
     finally:
         conn.close()
 
 
 def exigir_admin(user: Dict[str, Any]):
-    if user.get("role") != "ADMIN":
+    if user["role"] != "ADMIN":
         raise HTTPException(status_code=403, detail="Acesso restrito a administradores")
 
 
+# ==============================================================================
+# MOTOR ANTI-BANIMENTO + INTEGRAÇÃO COM WA-AKG
+# ==============================================================================
+def headers_wa():
+    h = {"Content-Type": "application/json"}
+    if API_KEY:
+        h["x-api-key"] = API_KEY
+    return h
+
+
+def obter_config_antiban_db() -> Dict[str, Any]:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM config_antiban WHERE id = 1")
+            cfg = cur.fetchone()
+            return dict(cfg) if cfg else {
+                "habilitado": True,
+                "limite_mensagens": 5,
+                "janela_segundos": 10,
+                "atraso_min_ms": 1000,
+                "atraso_max_ms": 3000,
+            }
+    finally:
+        conn.close()
+
+
+async def aplicar_protecao_antiban():
+    """Enfileira e aplica atraso aleatório inteligente quando o limite de taxa é atingido."""
+    cfg = obter_config_antiban_db()
+    if not cfg.get("habilitado"):
+        return
+
+    limite = max(1, int(cfg.get("limite_mensagens", 5)))
+    janela = max(1, int(cfg.get("janela_segundos", 10)))
+    min_ms = max(0, int(cfg.get("atraso_min_ms", 1000)))
+    max_ms = max(min_ms, int(cfg.get("atraso_max_ms", 3000)))
+
+    loop = asyncio.get_running_loop()
+    agora = loop.time()
+
+    while HISTORICO_ENVIOS_TS and (agora - HISTORICO_ENVIOS_TS[0]) > janela:
+        HISTORICO_ENVIOS_TS.popleft()
+
+    if len(HISTORICO_ENVIOS_TS) >= limite:
+        atraso_seg = random.uniform(min_ms / 1000.0, max_ms / 1000.0)
+        tempo_restante_janela = janela - (agora - HISTORICO_ENVIOS_TS[0])
+        espera_final = max(atraso_seg, min(tempo_restante_janela, max_ms / 1000.0))
+        logger.info(f"[Anti-Banimento] Limite de {limite} msgs/{janela}s atingido. Aguardando {espera_final:.2f}s...")
+        await asyncio.sleep(espera_final)
+
+    HISTORICO_ENVIOS_TS.append(loop.time())
+
+
+async def enviar_texto_wa(jid: str, texto: str) -> bool:
+    await aplicar_protecao_antiban()
+    url = f"{WA_BASE_URL}/api/sessions/{SESSION_ID}/messages/send"
+    payload = {"jid": jid, "type": "text", "message": {"text": texto}}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(url, json=payload, headers=headers_wa())
+            return resp.status_code in (200, 201)
+    except Exception as e:
+        logger.error(f"Erro ao enviar texto WA: {e}")
+        return False
+
+
+def converter_para_ogg(caminho_entrada: Path) -> Path:
+    caminho_saida = caminho_entrada.with_suffix(".ogg")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(caminho_entrada),
+        "-c:a", "libopus", "-b:a", "32k", "-vbr", "on", "-ar", "16000", "-ac", "1",
+        str(caminho_saida),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return caminho_saida
+
+
+async def enviar_midia_wa(jid: str, caminho_arquivo: Path, nome_arquivo: str, tipo: str, legenda: str = "") -> bool:
+    await aplicar_protecao_antiban()
+    url = f"{WA_BASE_URL}/api/sessions/{SESSION_ID}/messages/send-media"
+    headers = {}
+    if API_KEY:
+        headers["x-api-key"] = API_KEY
+
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            with open(caminho_arquivo, "rb") as f:
+                files = {"file": (nome_arquivo, f)}
+                data = {"jid": jid, "type": tipo, "caption": legenda}
+                resp = await client.post(url, data=data, files=files, headers=headers)
+                return resp.status_code in (200, 201)
+    except Exception as e:
+        logger.error(f"Erro ao enviar mídia WA: {e}")
+        return False
+
+
+async def baixar_midia_recebida(message_id: str, extensao: str = ".bin") -> Optional[str]:
+    url = f"{WA_BASE_URL}/api/sessions/{SESSION_ID}/messages/{message_id}/media"
+    headers = {}
+    if API_KEY:
+        headers["x-api-key"] = API_KEY
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200 and resp.content:
+                nome_local = f"{uuid.uuid4().hex}{extensao}"
+                destino = MEDIA_DIR / nome_local
+                destino.write_bytes(resp.content)
+                return f"/media/{nome_local}"
+    except Exception as e:
+        logger.error(f"Erro ao baixar mídia recebida: {e}")
+    return None
+
+
+def registrar_mensagem(
+    jid: str,
+    remetente: str,
+    conteudo: str,
+    nome: Optional[str] = None,
+    incrementar_nao_lidas: bool = False,
+    tipo_midia: str = "TEXT",
+    url_midia: Optional[str] = None,
+    setor_padrao: str = "TRIAGEM",
+    status_padrao: str = "TRIAGEM",
+):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT jid, nome FROM atendimentos WHERE jid = %s", (jid,))
+            existe = cur.fetchone()
+
+            if not existe:
+                nome_final = nome or jid.split("@")[0]
+                cur.execute(
+                    """
+                    INSERT INTO atendimentos (jid, nome, setor, status, ultima_mensagem, nao_lidas, atualizado_em)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (jid, nome_final, setor_padrao, status_padrao, conteudo[:250], 1 if incrementar_nao_lidas else 0),
+                )
+            else:
+                inc = 1 if incrementar_nao_lidas else 0
+                if nome and (not existe["nome"] or existe["nome"] == jid.split("@")[0]):
+                    cur.execute(
+                        """
+                        UPDATE atendimentos
+                        SET nome = %s, ultima_mensagem = %s, nao_lidas = nao_lidas + %s, atualizado_em = NOW()
+                        WHERE jid = %s
+                        """,
+                        (nome, conteudo[:250], inc, jid),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE atendimentos
+                        SET ultima_mensagem = %s, nao_lidas = nao_lidas + %s, atualizado_em = NOW()
+                        WHERE jid = %s
+                        """,
+                        (conteudo[:250], inc, jid),
+                    )
+
+            cur.execute(
+                """
+                INSERT INTO mensagens_atendimento (jid, remetente, conteudo, tipo_midia, url_midia)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (jid, remetente, conteudo, tipo_midia, url_midia),
+            )
+    finally:
+        conn.close()
+
+
+# ==============================================================================
+# LÓGICA DO WEBHOOK E ROTEAMENTO DINÂMICO POR PERFIL
+# ==============================================================================
+def gerar_menu_dinamico() -> str:
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT opcao_menu, nome FROM perfis_atendimento WHERE ativo = TRUE ORDER BY opcao_menu ASC")
+            perfis = cur.fetchall()
+            linhas = "\n".join([f"*{p['opcao_menu']}* - {p['nome']}" for p in perfis])
+            return (
+                "Olá! Bem-vindo ao atendimento da *Tottem Tecnologia* 👋\n\n"
+                "Para agilizar seu atendimento, responda com o número do departamento desejado:\n\n"
+                f"{linhas}"
+            )
+    finally:
+        conn.close()
+
+
+async def processar_webhook(payload: dict):
+    event = payload.get("event")
+    if event != "messages.upsert":
+        return
+
+    data = payload.get("data", {})
+    key = data.get("key", {})
+    if key.get("fromMe") is True:
+        return
+
+    jid = key.get("remoteJid", "")
+    if not jid or "@g.us" in jid or "status@broadcast" in jid:
+        return
+
+    msg_id = key.get("id", "")
+    nome_contato = data.get("pushName") or jid.split("@")[0]
+    msg = data.get("message", {})
+
+    tipo_midia = "TEXT"
+    url_midia = None
+    texto = ""
+
+    if "conversation" in msg:
+        texto = msg["conversation"]
+    elif "extendedTextMessage" in msg:
+        texto = msg["extendedTextMessage"].get("text", "")
+    elif "imageMessage" in msg:
+        tipo_midia = "IMAGE"
+        texto = msg["imageMessage"].get("caption") or "📷 Imagem recebida"
+        if msg_id:
+            url_midia = await baixar_midia_recebida(msg_id, ".jpg")
+    elif "audioMessage" in msg:
+        tipo_midia = "AUDIO"
+        texto = "🎵 Áudio recebido"
+        if msg_id:
+            url_midia = await baixar_midia_recebida(msg_id, ".ogg")
+    elif "videoMessage" in msg:
+        tipo_midia = "VIDEO"
+        texto = msg["videoMessage"].get("caption") or "🎥 Vídeo recebido"
+        if msg_id:
+            url_midia = await baixar_midia_recebida(msg_id, ".mp4")
+    elif "documentMessage" in msg:
+        tipo_midia = "DOCUMENT"
+        nome_doc = msg["documentMessage"].get("fileName", "documento.pdf")
+        ext = Path(nome_doc).suffix or ".pdf"
+        texto = f"📄 Documento: {nome_doc}"
+        if msg_id:
+            url_midia = await baixar_midia_recebida(msg_id, ext)
+    else:
+        texto = "[Mensagem recebida]"
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM atendimentos WHERE jid = %s", (jid,))
+            atendimento = cur.fetchone()
+
+            if not atendimento:
+                cur.execute("SELECT nome, razao_social FROM contatos_importados WHERE jid = %s LIMIT 1", (jid,))
+                contato_imp = cur.fetchone()
+                if contato_imp:
+                    nome_contato = contato_imp.get("nome") or contato_imp.get("razao_social") or nome_contato
+
+            registrar_mensagem(
+                jid, "CLIENTE", texto, nome=nome_contato,
+                incrementar_nao_lidas=True, tipo_midia=tipo_midia, url_midia=url_midia
+            )
+
+            if atendimento and atendimento["status"] == "EM_ATENDIMENTO":
+                return
+
+            opcao = texto.strip()
+            cur.execute(
+                "SELECT codigo, nome FROM perfis_atendimento WHERE ativo = TRUE AND opcao_menu = %s",
+                (opcao,),
+            )
+            perfil_escolhido = cur.fetchone()
+
+            if perfil_escolhido:
+                cur.execute(
+                    "UPDATE atendimentos SET setor = %s, status = 'EM_ATENDIMENTO', nao_lidas = 1 WHERE jid = %s",
+                    (perfil_escolhido["codigo"], jid),
+                )
+                resposta = f"✅ Perfeito! Encaminhei sua solicitação para *{perfil_escolhido['nome']}*. Um especialista já vai te atender."
+                await enviar_texto_wa(jid, resposta)
+                registrar_mensagem(jid, "BOT", resposta)
+            else:
+                menu = gerar_menu_dinamico()
+                await enviar_texto_wa(jid, menu)
+                registrar_mensagem(jid, "BOT", menu)
+    finally:
+        conn.close()
+
+
+# ==============================================================================
+# ROTAS DE AUTENTICAÇÃO E ADMINISTRAÇÃO
+# ==============================================================================
 @app.post("/api/auth/login")
 def login(dados: LoginReq):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT u.*, p.codigo AS perfil_codigo, p.nome AS perfil_nome
+            cur.execute(
+                """
+                SELECT u.id, u.nome, u.email, u.role, u.perfil_id,
+                       p.codigo AS perfil_codigo, p.nome AS perfil_nome
                 FROM usuarios_painel u
                 LEFT JOIN perfis_atendimento p ON u.perfil_id = p.id
-                WHERE u.email = %s AND u.senha_hash = %s AND u.ativo = 1
-            """, (dados.email.strip().lower(), hash_senha(dados.senha)))
+                WHERE u.email = %s AND u.senha_hash = %s
+                """,
+                (dados.email.strip().lower(), hash_senha(dados.senha)),
+            )
             user = cur.fetchone()
             if not user:
-                raise HTTPException(status_code=401, detail="Credenciais inválidas")
+                raise HTTPException(status_code=401, detail="E-mail ou senha inválidos")
 
-            token = secrets.token_hex(32)
+            token = uuid.uuid4().hex + uuid.uuid4().hex
             cur.execute("UPDATE usuarios_painel SET token_sessao = %s WHERE id = %s", (token, user["id"]))
 
             return {
@@ -766,14 +703,13 @@ def login(dados: LoginReq):
         conn.close()
 
 
-# --- ROTAS ADMIN: PERFIS E USUÁRIOS ---
 @app.get("/api/admin/perfis")
 def listar_perfis(request: Request):
     obter_usuario_atual(request)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM perfis_atendimento ORDER BY opcao_menu ASC")
+            cur.execute("SELECT * FROM perfis_atendimento WHERE ativo = TRUE ORDER BY opcao_menu ASC")
             return cur.fetchall()
     finally:
         conn.close()
@@ -788,14 +724,13 @@ def criar_perfil(dados: PerfilReq, request: Request):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO perfis_atendimento (codigo, nome, opcao_menu, descricao)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO perfis_atendimento (codigo, nome, opcao_menu, ativo)
+                VALUES (%s, %s, %s, TRUE)
+                ON CONFLICT (codigo) DO UPDATE SET nome = EXCLUDED.nome, opcao_menu = EXCLUDED.opcao_menu, ativo = TRUE
                 """,
-                (dados.codigo.strip().upper(), dados.nome.strip(), dados.opcao_menu.strip(), dados.descricao.strip()),
+                (dados.codigo.strip().upper(), dados.nome.strip(), dados.opcao_menu.strip()),
             )
-        return {"status": "criado"}
-    except psycopg2.IntegrityError:
-        raise HTTPException(status_code=400, detail="Código já existe.")
+        return {"status": "ok"}
     finally:
         conn.close()
 
@@ -807,8 +742,8 @@ def excluir_perfil(perfil_id: int, request: Request):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM perfis_atendimento WHERE id = %s", (perfil_id,))
-        return {"status": "excluido"}
+            cur.execute("UPDATE perfis_atendimento SET ativo = FALSE WHERE id = %s", (perfil_id,))
+        return {"status": "ok"}
     finally:
         conn.close()
 
@@ -820,13 +755,15 @@ def listar_usuarios(request: Request):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT u.id, u.nome, u.email, u.role, u.perfil_id, u.ativo,
+            cur.execute(
+                """
+                SELECT u.id, u.nome, u.email, u.role, u.perfil_id,
                        p.nome AS perfil_nome, p.codigo AS perfil_codigo
                 FROM usuarios_painel u
                 LEFT JOIN perfis_atendimento p ON u.perfil_id = p.id
                 ORDER BY u.id ASC
-            """)
+                """
+            )
             return cur.fetchall()
     finally:
         conn.close()
@@ -848,9 +785,9 @@ def criar_usuario(dados: UsuarioReq, request: Request):
                 """,
                 (dados.nome.strip(), dados.email.strip().lower(), hash_senha(dados.senha), dados.role, dados.perfil_id),
             )
-        return {"status": "criado"}
-    except psycopg2.IntegrityError:
-        raise HTTPException(status_code=400, detail="E-mail já cadastrado.")
+        return {"status": "ok"}
+    except Exception:
+        raise HTTPException(status_code=400, detail="E-mail já cadastrado")
     finally:
         conn.close()
 
@@ -863,14 +800,10 @@ def vincular_usuario_perfil(usuario_id: int, dados: UsuarioReq, request: Request
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                UPDATE usuarios_painel
-                SET nome = %s, email = %s, role = %s, perfil_id = %s
-                WHERE id = %s
-                """,
-                (dados.nome.strip(), dados.email.strip().lower(), dados.role, dados.perfil_id, usuario_id),
+                "UPDATE usuarios_painel SET perfil_id = %s, role = %s WHERE id = %s",
+                (dados.perfil_id, dados.role, usuario_id),
             )
-        return {"status": "atualizado"}
+        return {"status": "ok"}
     finally:
         conn.close()
 
@@ -880,37 +813,204 @@ def excluir_usuario(usuario_id: int, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     if user["id"] == usuario_id:
-        raise HTTPException(status_code=400, detail="Não é possível excluir seu próprio usuário.")
+        raise HTTPException(status_code=400, detail="Você não pode excluir seu próprio usuário")
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM usuarios_painel WHERE id = %s", (usuario_id,))
-        return {"status": "excluido"}
+        return {"status": "ok"}
     finally:
         conn.close()
 
 
-# --- ROTAS CONTATOS IMPORTADOS: LISTAGEM, SINCRONIZAÇÃO COM PESSOAS, PREVIEW E IMPORTAÇÃO ---
-@app.get("/api/admin/contatos")
-def listar_contatos_importados(request: Request):
+# --- ROTAS DE CONFIGURAÇÃO ANTI-BANIMENTO ---
+@app.get("/api/admin/antiban")
+def get_antiban(request: Request):
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+    return obter_config_antiban_db()
+
+
+@app.post("/api/admin/antiban")
+def salvar_antiban(dados: ConfigAntiBanReq, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM contatos_importados ORDER BY id DESC LIMIT 2000")
-            return cur.fetchall()
+            cur.execute(
+                """
+                UPDATE config_antiban
+                SET habilitado = %s, limite_mensagens = %s, janela_segundos = %s,
+                    atraso_min_ms = %s, atraso_max_ms = %s
+                WHERE id = 1
+                """,
+                (
+                    dados.habilitado,
+                    max(1, dados.limite_mensagens),
+                    max(1, dados.janela_segundos),
+                    max(0, dados.atraso_min_ms),
+                    max(dados.atraso_min_ms, dados.atraso_max_ms),
+                ),
+            )
+        return {"status": "ok"}
     finally:
         conn.close()
 
 
+# --- FUNÇÃO AUXILIAR DE LEITURA DE PLANILHA (.XLSX / .CSV) ---
+def ler_linhas_planilha(conteudo_bytes: bytes, filename: str) -> List[List[str]]:
+    nome_arq = (filename or "").lower()
+    linhas_raw: List[List[str]] = []
+
+    if nome_arq.endswith((".xlsx", ".xlsm")):
+        wb = openpyxl.load_workbook(io.BytesIO(conteudo_bytes), read_only=True, data_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(values_only=True):
+            linhas_raw.append([str(c).strip() if c is not None else "" for c in row])
+    else:
+        texto_csv = conteudo_bytes.decode("utf-8-sig", errors="replace")
+        delimitador = ";" if texto_csv.count(";") > texto_csv.count(",") else ","
+        reader = csv.reader(io.StringIO(texto_csv), delimiter=delimitador)
+        for row in reader:
+            linhas_raw.append([c.strip() for c in row])
+
+    return [r for r in linhas_raw if any(cell != "" for cell in r)]
+
+
+# --- PREVIEW DA PLANILHA ANTES DA IMPORTAÇÃO ---
+@app.post("/api/admin/contatos/preview")
+async def preview_planilha_contatos(request: Request, arquivo: UploadFile = File(...)):
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+
+    conteudo_bytes = await arquivo.read()
+    linhas = ler_linhas_planilha(conteudo_bytes, arquivo.filename or "")
+
+    if not linhas:
+        raise HTTPException(status_code=400, detail="O arquivo está vazio ou não pôde ser lido.")
+
+    cabecalho_raw = linhas[0]
+    num_cols = max(len(r) for r in linhas[:20])
+    colunas = [
+        cabecalho_raw[i] if i < len(cabecalho_raw) and cabecalho_raw[i] else f"Coluna {i + 1}"
+        for i in range(num_cols)
+    ]
+
+    preview_linhas = []
+    for row in linhas[1:11]:
+        linha_pad = [row[i] if i < len(row) else "" for i in range(num_cols)]
+        preview_linhas.append(linha_pad)
+
+    return {
+        "filename": arquivo.filename,
+        "colunas": colunas,
+        "preview": preview_linhas,
+        "total_linhas": max(0, len(linhas) - 1),
+    }
+
+
+# --- IMPORTAÇÃO COM MAPEAMENTO CONFIRMADO ---
+@app.post("/api/admin/contatos/importar-mapeado")
+async def importar_planilha_mapeada(
+    request: Request,
+    arquivo: UploadFile = File(...),
+    col_cnpj: int = Form(-1),
+    col_razao: int = Form(-1),
+    col_nome: int = Form(-1),
+    col_celular: int = Form(-1),
+    col_telefone: int = Form(-1),
+):
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+
+    if col_celular < 0 and col_telefone < 0:
+        raise HTTPException(status_code=400, detail="Selecione pelo menos a coluna de Celular ou Telefone.")
+
+    conteudo_bytes = await arquivo.read()
+    linhas = ler_linhas_planilha(conteudo_bytes, arquivo.filename or "")
+    if len(linhas) < 2:
+        raise HTTPException(status_code=400, detail="A planilha não possui linhas de dados.")
+
+    def pegar_valor(row: List[str], idx: int) -> str:
+        if idx < 0 or idx >= len(row):
+            return ""
+        return row[idx].strip()
+
+    conn = get_db_connection()
+    importados = 0
+    ignorados_sem_tel = 0
+    ignorados_ja_comprou = 0
+
+    try:
+        with conn.cursor() as cur:
+            # Verifica CNPJs que já compraram na tabela 'pessoas' do Supabase
+            cnpjs_comprados = set()
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'pessoas'
+                ) AS existe;
+            """)
+            if cur.fetchone()["existe"]:
+                cur.execute("SELECT cnpj, status_venda FROM pessoas")
+                for p in cur.fetchall():
+                    st = (p.get("status_venda") or "").strip().upper()
+                    if ("COMPROU" in st or "CONVERTIDO" in st) and "NAO" not in st and "NÃO" not in st:
+                        c_limpo = limpar_digitos(p.get("cnpj"))
+                        if c_limpo:
+                            cnpjs_comprados.add(c_limpo)
+
+            for row in linhas[1:]:
+                cnpj = pegar_valor(row, col_cnpj)
+                razao = pegar_valor(row, col_razao)
+                nome = pegar_valor(row, col_nome)
+                celular = pegar_valor(row, col_celular)
+                telefone = pegar_valor(row, col_telefone)
+
+                if cnpj and limpar_digitos(cnpj) in cnpjs_comprados:
+                    ignorados_ja_comprou += 1
+                    continue
+
+                jid = normalizar_numero_wa(celular, telefone)
+                if not jid:
+                    ignorados_sem_tel += 1
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT INTO contatos_importados
+                        (cnpj, nome, razao_social, telefone, celular, jid, status_contato, origem)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'nao_enviado', 'PLANILHA')
+                    ON CONFLICT (jid) DO UPDATE SET
+                        cnpj = CASE WHEN EXCLUDED.cnpj != '' THEN EXCLUDED.cnpj ELSE contatos_importados.cnpj END,
+                        nome = CASE WHEN EXCLUDED.nome != '' THEN EXCLUDED.nome ELSE contatos_importados.nome END,
+                        razao_social = CASE WHEN EXCLUDED.razao_social != '' THEN EXCLUDED.razao_social ELSE contatos_importados.razao_social END,
+                        telefone = CASE WHEN EXCLUDED.telefone != '' THEN EXCLUDED.telefone ELSE contatos_importados.telefone END,
+                        celular = CASE WHEN EXCLUDED.celular != '' THEN EXCLUDED.celular ELSE contatos_importados.celular END
+                    """,
+                    (cnpj, nome, razao, telefone, celular, jid),
+                )
+                importados += 1
+
+        return {
+            "status": "ok",
+            "importados": importados,
+            "ignorados": ignorados_sem_tel,
+            "ignorados_ja_comprou": ignorados_ja_comprou,
+        }
+    finally:
+        conn.close()
+
+
+# --- SINCRONIZAÇÃO COM A TABELA 'pessoas' DO SUPABASE ---
 @app.post("/api/admin/contatos/sincronizar-pessoas")
 def sincronizar_com_tabela_pessoas(request: Request):
     """
-    Sincroniza contatos_importados com a tabela pessoas (somente leitura na tabela pessoas):
-    1. Se CNPJ em pessoas tiver status_venda = COMPROU (ou CONVERTIDO), APAGA de contatos_importados.
-    2. Se CNPJ em pessoas tiver status_venda = NAO_COMPROU / NÃO COMPROU, marca como 'nao_comprou'
-       (ou importa em contatos_importados caso ainda não esteja lá).
+    Sincroniza a tabela 'contatos_importados' com a tabela 'pessoas' do Supabase:
+    1. Se o registro em 'pessoas' estiver como COMPROU -> remove de 'contatos_importados'.
+    2. Se o registro em 'pessoas' estiver como NAO_COMPROU (ou NÃO COMPROU) ->
+       marca como 'nao_comprou' em 'contatos_importados' (ou importa se ainda não existir).
     """
     user = obter_usuario_atual(request)
     exigir_admin(user)
@@ -919,10 +1019,10 @@ def sincronizar_com_tabela_pessoas(request: Request):
     removidos_comprou = 0
     marcados_nao_comprou = 0
     novos_nao_comprou = 0
+    total_lido_pessoas = 0
 
     try:
         with conn.cursor() as cur:
-            # Verifica se a tabela pessoas existe no schema public
             cur.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables
@@ -934,6 +1034,7 @@ def sincronizar_com_tabela_pessoas(request: Request):
 
             cur.execute("SELECT cnpj, razao_social, nome_fantasia, telefone, status_venda FROM pessoas")
             pessoas_rows = cur.fetchall()
+            total_lido_pessoas = len(pessoas_rows)
 
             cur.execute("SELECT id, cnpj, jid, status_contato FROM contatos_importados")
             contatos_rows = cur.fetchall()
@@ -961,15 +1062,28 @@ def sincronizar_com_tabela_pessoas(request: Request):
 
                 existentes = mapa_contatos_por_cnpj.get(cnpj_limpo, [])
 
-                # Regra 1: Só apaga de contatos_importados quando na tabela pessoas estiver COMPROU
-                if "NAO" not in status_norm and ("COMPROU" in status_norm or "CONVERTIDO" in status_norm):
+                eh_nao_comprou = (
+                    ("NAO" in status_norm and "COMPROU" in status_norm)
+                    or "PERDIDO" in status_norm
+                    or "CANCELADO" in status_norm
+                )
+                eh_comprou = (
+                    not eh_nao_comprou
+                    and (
+                        "COMPROU" in status_norm
+                        or "CONVERTIDO" in status_norm
+                        or "PAGO" in status_norm
+                        or "ATIVO" in status_norm
+                    )
+                )
+
+                if eh_comprou:
                     if existentes:
                         ids_remover = [item["id"] for item in existentes]
                         cur.execute("DELETE FROM contatos_importados WHERE id = ANY(%s)", (ids_remover,))
                         removidos_comprou += cur.rowcount
 
-                # Regra 2: Se estiver NAO COMPROU na tabela pessoas, marca/insere como 'nao_comprou'
-                elif "NAO" in status_norm and "COMPROU" in status_norm:
+                elif eh_nao_comprou:
                     if existentes:
                         for item in existentes:
                             if item.get("status_contato") != "nao_comprou":
@@ -1003,6 +1117,7 @@ def sincronizar_com_tabela_pessoas(request: Request):
 
         return {
             "status": "ok",
+            "total_lido_pessoas": total_lido_pessoas,
             "removidos_comprou": removidos_comprou,
             "marcados_nao_comprou": marcados_nao_comprou,
             "novos_nao_comprou": novos_nao_comprou,
@@ -1011,166 +1126,34 @@ def sincronizar_com_tabela_pessoas(request: Request):
         conn.close()
 
 
-@app.post("/api/admin/contatos/preview")
-async def preview_planilha_contatos(request: Request, arquivo: UploadFile = File(...)):
+@app.get("/api/admin/contatos")
+def listar_contatos_importados(request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
-
-    conteudo = await arquivo.read()
-    if not conteudo:
-        raise HTTPException(status_code=400, detail="O arquivo enviado está vazio.")
-
-    dados = ler_planilha_bruta(conteudo, arquivo.filename or "planilha.csv")
-    return {
-        "filename": arquivo.filename,
-        "colunas": dados["colunas"],
-        "preview": dados["linhas"][:10],
-        "total_linhas": len(dados["linhas"]),
-    }
-
-
-@app.post("/api/admin/contatos/importar-mapeado")
-async def importar_planilha_mapeada(
-    request: Request,
-    arquivo: UploadFile = File(...),
-    col_cnpj: str = Form(""),
-    col_nome: str = Form(""),
-    col_razao: str = Form(""),
-    col_telefone: str = Form(""),
-    col_celular: str = Form(""),
-):
-    """Importa a planilha para contatos_importados (ignorando CNPJs que já estejam como COMPROU na tabela pessoas)."""
-    user = obter_usuario_atual(request)
-    exigir_admin(user)
-
-    conteudo = await arquivo.read()
-    dados = ler_planilha_bruta(conteudo, arquivo.filename or "planilha.csv")
-    colunas = dados["colunas"]
-    linhas = dados["linhas"]
-
-    def idx_coluna(col_param: str) -> Optional[int]:
-        if col_param == "" or col_param == "-1":
-            return None
-        try:
-            i = int(col_param)
-            return i if 0 <= i < len(colunas) else None
-        except ValueError:
-            return colunas.index(col_param) if col_param in colunas else None
-
-    i_cnpj = idx_coluna(col_cnpj)
-    i_nome = idx_coluna(col_nome)
-    i_razao = idx_coluna(col_razao)
-    i_tel = idx_coluna(col_telefone)
-    i_cel = idx_coluna(col_celular)
-
-    if i_tel is None and i_cel is None:
-        raise HTTPException(status_code=400, detail="Vincule pelo menos a coluna de Celular ou Telefone.")
-
-    importados = 0
-    ignorados = 0
-    ignorados_ja_comprou = 0
-
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Consulta CNPJs que já compraram na tabela pessoas para não importar de novo
-            cnpjs_comprados = set()
-            cnpjs_nao_compraram = set()
-            cur.execute("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables
-                    WHERE table_schema = 'public' AND table_name = 'pessoas'
-                ) AS existe;
-            """)
-            if cur.fetchone()["existe"]:
-                cur.execute("SELECT cnpj, status_venda FROM pessoas")
-                for p in cur.fetchall():
-                    c_dig = limpar_digitos(p.get("cnpj"))
-                    st = (p.get("status_venda") or "").upper().replace("Ã", "A")
-                    if c_dig:
-                        if "NAO" not in st and ("COMPROU" in st or "CONVERTIDO" in st):
-                            cnpjs_comprados.add(c_dig)
-                        elif "NAO" in st and "COMPROU" in st:
-                            cnpjs_nao_compraram.add(c_dig)
-
-            for row in linhas:
-                cnpj = row[i_cnpj] if i_cnpj is not None and i_cnpj < len(row) else ""
-                nome = row[i_nome] if i_nome is not None and i_nome < len(row) else ""
-                razao = row[i_razao] if i_razao is not None and i_razao < len(row) else ""
-                telefone = row[i_tel] if i_tel is not None and i_tel < len(row) else ""
-                celular = row[i_cel] if i_cel is not None and i_cel < len(row) else ""
-
-                cnpj_dig = limpar_digitos(cnpj)
-                if cnpj_dig and cnpj_dig in cnpjs_comprados:
-                    ignorados_ja_comprou += 1
-                    continue
-
-                jid = normalizar_numero_wa(celular, telefone)
-                if not jid:
-                    ignorados += 1
-                    continue
-
-                status_inicial = "nao_comprou" if (cnpj_dig and cnpj_dig in cnpjs_nao_compraram) else "nao_enviado"
-
-                cur.execute("""
-                    INSERT INTO contatos_importados
-                        (cnpj, nome, razao_social, telefone, celular, jid, status_contato, origem)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (jid) DO UPDATE SET
-                        cnpj = CASE WHEN EXCLUDED.cnpj != '' THEN EXCLUDED.cnpj ELSE contatos_importados.cnpj END,
-                        nome = CASE WHEN EXCLUDED.nome != '' THEN EXCLUDED.nome ELSE contatos_importados.nome END,
-                        razao_social = CASE WHEN EXCLUDED.razao_social != '' THEN EXCLUDED.razao_social ELSE contatos_importados.razao_social END,
-                        telefone = CASE WHEN EXCLUDED.telefone != '' THEN EXCLUDED.telefone ELSE contatos_importados.telefone END,
-                        celular = CASE WHEN EXCLUDED.celular != '' THEN EXCLUDED.celular ELSE contatos_importados.celular END
-                """, (
-                    cnpj, nome, razao, telefone, celular, jid, status_inicial, arquivo.filename or "PLANILHA"
-                ))
-                importados += 1
+            cur.execute("SELECT * FROM contatos_importados ORDER BY id DESC LIMIT 1000")
+            return cur.fetchall()
     finally:
         conn.close()
 
-    return {
-        "status": "ok",
-        "importados": importados,
-        "ignorados": ignorados,
-        "ignorados_ja_comprou": ignorados_ja_comprou,
-        "total_lido": len(linhas),
-    }
-
 
 @app.put("/api/admin/contatos/{contato_id}/status")
-def atualizar_status_contato(contato_id: int, dados: AlterarStatusContatoReq, request: Request):
+def atualizar_status_contato(contato_id: int, dados: AtualizarStatusContatoReq, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
-    status_valido = dados.status_contato.strip().lower()
-    if status_valido not in {"nao_enviado", "enviou", "falha", "nao_comprou"}:
+    status_val = (dados.status_contato or "").strip().lower()
+    if status_val not in {"nao_enviado", "enviou", "falha", "nao_comprou"}:
         raise HTTPException(status_code=400, detail="Status inválido.")
-
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE contatos_importados SET status_contato = %s WHERE id = %s",
-                (status_valido, contato_id),
+                (status_val, contato_id),
             )
-        return {"status": "atualizado"}
-    finally:
-        conn.close()
-
-
-@app.post("/api/admin/contatos/excluir-massa")
-def excluir_contatos_massa(dados: ExcluirMassaContatosReq, request: Request):
-    user = obter_usuario_atual(request)
-    exigir_admin(user)
-    if not dados.ids:
-        raise HTTPException(status_code=400, detail="Nenhum contato selecionado para exclusão.")
-
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM contatos_importados WHERE id = ANY(%s)", (dados.ids,))
-            excluidos = cur.rowcount
-        return {"status": "excluido", "total": excluidos}
+        return {"status": "ok"}
     finally:
         conn.close()
 
@@ -1183,13 +1166,29 @@ def excluir_contato(contato_id: int, request: Request):
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM contatos_importados WHERE id = %s", (contato_id,))
-        return {"status": "excluido"}
+        return {"status": "ok"}
+    finally:
+        conn.close()
+
+
+@app.post("/api/admin/contatos/excluir-massa")
+def excluir_contatos_em_massa(dados: ExcluirMassaContatosReq, request: Request):
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+    if not dados.ids:
+        return {"status": "ok", "excluidos": 0}
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM contatos_importados WHERE id = ANY(%s)", (dados.ids,))
+            excluidos = cur.rowcount
+        return {"status": "ok", "excluidos": excluidos}
     finally:
         conn.close()
 
 
 @app.post("/api/admin/contatos/abrir-conversa")
-def abrir_conversa_contato(dados: IniciarChatContatoReq, request: Request):
+def abrir_conversa_contato(dados: AbrirConversaContatoReq, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     conn = get_db_connection()
@@ -1200,20 +1199,29 @@ def abrir_conversa_contato(dados: IniciarChatContatoReq, request: Request):
             if not contato:
                 raise HTTPException(status_code=404, detail="Contato não encontrado")
 
-            nome_chat = contato["nome"] or contato["razao_social"] or contato["jid"].split("@")[0]
-            cur.execute("""
-                INSERT INTO atendimentos (jid, nome, setor, status, ultima_mensagem, atualizado_em)
-                VALUES (%s, %s, %s, 'EM_ATENDIMENTO', 'Conversa iniciada via Contatos Importados', NOW())
-                ON CONFLICT (jid) DO UPDATE SET
-                    setor = EXCLUDED.setor,
-                    status = 'EM_ATENDIMENTO',
-                    atualizado_em = NOW()
-            """, (contato["jid"], nome_chat, dados.setor_destino))
-            return {"status": "ok", "jid": contato["jid"]}
+            jid = contato["jid"]
+            nome_exibicao = contato.get("nome") or contato.get("razao_social") or jid.split("@")[0]
+
+            cur.execute("SELECT jid FROM atendimentos WHERE jid = %s", (jid,))
+            if not cur.fetchone():
+                cur.execute(
+                    """
+                    INSERT INTO atendimentos (jid, nome, setor, status, ultima_mensagem, nao_lidas, atualizado_em)
+                    VALUES (%s, %s, %s, 'EM_ATENDIMENTO', 'Conversa iniciada via Contatos Importados', 0, NOW())
+                    """,
+                    (jid, nome_exibicao, dados.setor_destino),
+                )
+            else:
+                cur.execute(
+                    "UPDATE atendimentos SET setor = %s, status = 'EM_ATENDIMENTO', atualizado_em = NOW() WHERE jid = %s",
+                    (dados.setor_destino, jid),
+                )
+        return {"status": "ok", "jid": jid}
     finally:
         conn.close()
 
 
+# --- TEMPLATES E DISPARO EM MASSA ---
 @app.get("/api/admin/templates")
 def listar_templates(request: Request):
     user = obter_usuario_atual(request)
@@ -1239,13 +1247,13 @@ def criar_template(dados: TemplateReq, request: Request):
                 (dados.titulo.strip(), dados.conteudo.strip()),
             )
             novo_id = cur.fetchone()["id"]
-        return {"status": "criado", "id": novo_id}
+        return {"status": "ok", "id": novo_id}
     finally:
         conn.close()
 
 
-@app.put("/api/admin/templates/{tpl_id}")
-def atualizar_template(tpl_id: int, dados: TemplateReq, request: Request):
+@app.put("/api/admin/templates/{template_id}")
+def editar_template(template_id: int, dados: TemplateReq, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     conn = get_db_connection()
@@ -1253,57 +1261,22 @@ def atualizar_template(tpl_id: int, dados: TemplateReq, request: Request):
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE templates_disparo SET titulo = %s, conteudo = %s WHERE id = %s",
-                (dados.titulo.strip(), dados.conteudo.strip(), tpl_id),
+                (dados.titulo.strip(), dados.conteudo.strip(), template_id),
             )
-        return {"status": "atualizado", "id": tpl_id}
+        return {"status": "ok"}
     finally:
         conn.close()
 
 
-@app.delete("/api/admin/templates/{tpl_id}")
-def excluir_template(tpl_id: int, request: Request):
+@app.delete("/api/admin/templates/{template_id}")
+def excluir_template(template_id: int, request: Request):
     user = obter_usuario_atual(request)
     exigir_admin(user)
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM templates_disparo WHERE id = %s", (tpl_id,))
-        return {"status": "excluido"}
-    finally:
-        conn.close()
-
-
-@app.get("/api/admin/antiban")
-def obter_antiban(request: Request):
-    user = obter_usuario_atual(request)
-    exigir_admin(user)
-    return obter_config_antiban_db()
-
-
-@app.post("/api/admin/antiban")
-def salvar_antiban(dados: AntiBanReq, request: Request):
-    user = obter_usuario_atual(request)
-    exigir_admin(user)
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE config_antiban
-                SET habilitado = %s,
-                    limite_mensagens = %s,
-                    janela_segundos = %s,
-                    atraso_min_ms = %s,
-                    atraso_max_ms = %s,
-                    atualizado_em = NOW()
-                WHERE id = 1
-            """, (
-                1 if dados.habilitado else 0,
-                max(1, dados.limite_mensagens),
-                max(1, dados.janela_segundos),
-                max(0, dados.atraso_min_ms),
-                max(dados.atraso_min_ms, dados.atraso_max_ms),
-            ))
-        return {"status": "salvo"}
+            cur.execute("DELETE FROM templates_disparo WHERE id = %s", (template_id,))
+        return {"status": "ok"}
     finally:
         conn.close()
 
@@ -1323,17 +1296,29 @@ async def executar_campanha_background(
 
     total_mensagens = sum(len(jids) for _, jids in fila_envios)
     CAMPANHA_STATUS["em_execucao"] = True
+    CAMPANHA_STATUS["cancelar"] = False
     CAMPANHA_STATUS["total"] = total_mensagens
     CAMPANHA_STATUS["enviados"] = 0
     CAMPANHA_STATUS["falhas"] = 0
+    interrompido = False
 
     try:
         for contato, jids in fila_envios:
+            if CAMPANHA_STATUS.get("cancelar"):
+                interrompido = True
+                break
+
             nome_contato = contato.get("nome") or contato.get("razao_social") or jids[0].split("@")[0]
             mensagem_final = aplicar_variaveis_template(template_texto, contato)
             algum_sucesso = False
+            tentou_algum = False
 
             for idx, jid in enumerate(jids):
+                if CAMPANHA_STATUS.get("cancelar"):
+                    interrompido = True
+                    break
+
+                tentou_algum = True
                 tag_num = f" [{idx + 1}/{len(jids)}]" if len(jids) > 1 else ""
                 CAMPANHA_STATUS["atual"] = f"{nome_contato} ({jid.split('@')[0]}){tag_num}"
                 CAMPANHA_STATUS["mensagem_status"] = f"Enviando para {nome_contato} ({jid.split('@')[0]}){tag_num}..."
@@ -1355,26 +1340,32 @@ async def executar_campanha_background(
                 else:
                     CAMPANHA_STATUS["falhas"] += 1
 
-            conn = get_db_connection()
-            try:
-                with conn.cursor() as cur:
-                    if algum_sucesso:
-                        cur.execute(
-                            "UPDATE contatos_importados SET status_contato = 'enviou', ultimo_disparo = NOW() WHERE id = %s",
-                            (contato["id"],),
-                        )
-                    else:
-                        cur.execute(
-                            "UPDATE contatos_importados SET status_contato = 'falha' WHERE id = %s",
-                            (contato["id"],),
-                        )
-            finally:
-                conn.close()
+            if tentou_algum and (algum_sucesso or not interrompido):
+                conn = get_db_connection()
+                try:
+                    with conn.cursor() as cur:
+                        if algum_sucesso:
+                            cur.execute(
+                                "UPDATE contatos_importados SET status_contato = 'enviou', ultimo_disparo = NOW() WHERE id = %s",
+                                (contato["id"],),
+                            )
+                        else:
+                            cur.execute(
+                                "UPDATE contatos_importados SET status_contato = 'falha' WHERE id = %s",
+                                (contato["id"],),
+                            )
+                finally:
+                    conn.close()
+
+            if interrompido:
+                break
     finally:
         CAMPANHA_STATUS["em_execucao"] = False
+        CAMPANHA_STATUS["cancelar"] = False
         CAMPANHA_STATUS["atual"] = ""
+        prefixo = "⏹️ Envio interrompido pelo usuário" if interrompido else "✅ Concluído"
         CAMPANHA_STATUS["mensagem_status"] = (
-            f"Concluído: {CAMPANHA_STATUS['enviados']} enviados, {CAMPANHA_STATUS['falhas']} falhas."
+            f"{prefixo}: {CAMPANHA_STATUS['enviados']} enviados, {CAMPANHA_STATUS['falhas']} falhas."
         )
 
 
@@ -1424,6 +1415,19 @@ async def iniciar_disparo_massa(dados: DisparoMassaReq, request: Request, backgr
         dados.enviar_ambos_numeros,
     )
     return {"status": "iniciado", "total": total_destinos, "contatos": len(contatos)}
+
+
+@app.post("/api/admin/disparo-massa/parar")
+def parar_disparo_massa(request: Request):
+    user = obter_usuario_atual(request)
+    exigir_admin(user)
+
+    if not CAMPANHA_STATUS["em_execucao"]:
+        raise HTTPException(status_code=400, detail="Nenhum disparo em massa está em execução no momento.")
+
+    CAMPANHA_STATUS["cancelar"] = True
+    CAMPANHA_STATUS["mensagem_status"] = "Interrompendo disparo após a mensagem atual..."
+    return {"status": "interrompendo"}
 
 
 @app.get("/api/admin/disparo-massa/status")
@@ -1973,7 +1977,7 @@ HTML_PAINEL = """
             </div>
           </div>
 
-          <!-- CARD 3: EXECUTAR DISPARO EM MASSA -->
+          <!-- CARD 3: EXECUTAR E PARAR DISPARO EM MASSA -->
           <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col justify-between">
             <div>
               <span class="text-[11px] font-bold uppercase tracking-wider text-amber-600">Passo 3 • Campanha Ativa</span>
@@ -2005,8 +2009,11 @@ HTML_PAINEL = """
               </div>
             </div>
             <div class="mt-3 space-y-2">
-              <button onclick="iniciarDisparoMassa()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-2.5 rounded-xl text-xs shadow-sm transition">
+              <button id="btnIniciarDisparo" onclick="iniciarDisparoMassa()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-2.5 rounded-xl text-xs shadow-sm transition">
                 Iniciar Envio em Massa
+              </button>
+              <button id="btnPararDisparo" onclick="pararDisparoMassa()" class="hidden w-full bg-rose-600 hover:bg-rose-700 text-white font-semibold py-2.5 rounded-xl text-xs shadow-sm transition">
+                ⏹️ Parar Envio em Massa
               </button>
               <div id="boxProgressoCampanha" class="hidden bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-[11px] text-slate-700"></div>
             </div>
@@ -2221,6 +2228,7 @@ HTML_PAINEL = """
     let intervalo = null;
     let mediaRecorder = null;
     let audioChunks = [];
+    let CAMPANHA_ESTAVA_RODANDO = false;
 
     if (TOKEN && USUARIO) {
       iniciarPainel();
@@ -2308,6 +2316,7 @@ HTML_PAINEL = """
       if (aba === "contatos") {
         carregarContatos();
         carregarTemplates();
+        verificarProgressoCampanha();
       } else if (aba === "antiban") {
         carregarConfigAntiBan();
       } else if (aba === "perfis") {
@@ -2320,6 +2329,7 @@ HTML_PAINEL = """
     // --- PERFIS E USUÁRIOS ---
     async function carregarPerfis() {
       const res = await fetch("/api/admin/perfis", { headers: authHeaders() });
+      if (res.status === 401) return sair();
       if (!res.ok) return;
       PERFIS = await res.json();
 
@@ -2433,7 +2443,7 @@ HTML_PAINEL = """
         if (res.ok) {
           const banner = document.getElementById("bannerSincronizacao");
           document.getElementById("textoSincronizacao").innerHTML =
-            `✅ Sincronização com <code>pessoas</code> concluída: <strong>${data.removidos_comprou}</strong> removido(s) por status <strong>COMPROU</strong> • <strong>${data.marcados_nao_comprou}</strong> atualizado(s) e <strong>${data.novos_nao_comprou}</strong> importado(s) como <strong>nao_comprou</strong>.`;
+            `✅ Sincronização com <code>pessoas</code> (${data.total_lido_pessoas} lidos): <strong>${data.removidos_comprou}</strong> removido(s) por status <strong>COMPROU</strong> • <strong>${data.marcados_nao_comprou}</strong> atualizado(s) e <strong>${data.novos_nao_comprou}</strong> importado(s) como <strong>nao_comprou</strong>.`;
           banner.classList.remove("hidden");
           await carregarContatos();
         } else {
@@ -2855,11 +2865,51 @@ HTML_PAINEL = """
       }
     }
 
+    async function pararDisparoMassa() {
+      if (!confirm("Deseja realmente interromper o envio em massa agora?")) return;
+      const btnParar = document.getElementById("btnPararDisparo");
+      btnParar.disabled = true;
+      btnParar.innerText = "Interrompendo...";
+
+      try {
+        const res = await fetch("/api/admin/disparo-massa/parar", {
+          method: "POST",
+          headers: authHeaders()
+        });
+        if (res.ok) {
+          verificarProgressoCampanha();
+        } else {
+          const err = await res.json().catch(() => ({}));
+          alert(err.detail || "Não foi possível parar o disparo.");
+        }
+      } finally {
+        btnParar.disabled = false;
+        btnParar.innerText = "⏹️ Parar Envio em Massa";
+      }
+    }
+
     async function verificarProgressoCampanha() {
       const res = await fetch("/api/admin/disparo-massa/status", { headers: authHeaders() });
       if (!res.ok) return;
       const st = await res.json();
+
+      const btnIniciar = document.getElementById("btnIniciarDisparo");
+      const btnParar = document.getElementById("btnPararDisparo");
       const box = document.getElementById("boxProgressoCampanha");
+
+      if (st.em_execucao) {
+        btnIniciar.classList.add("hidden");
+        btnParar.classList.remove("hidden");
+        CAMPANHA_ESTAVA_RODANDO = true;
+      } else {
+        btnIniciar.classList.remove("hidden");
+        btnParar.classList.add("hidden");
+        if (CAMPANHA_ESTAVA_RODANDO) {
+          CAMPANHA_ESTAVA_RODANDO = false;
+          carregarContatos();
+        }
+      }
+
       if (st.total > 0) {
         box.classList.remove("hidden");
         box.innerHTML = `<strong>${st.mensagem_status}</strong><br>Progresso: ${st.enviados + st.falhas}/${st.total} (Falhas: ${st.falhas})`;
@@ -2900,6 +2950,7 @@ HTML_PAINEL = """
     async function atualizarFila() {
       const filtro = document.getElementById("filtroAdminSetor").value || "TODOS";
       const res = await fetch(`/api/painel/chats?filtro_setor=${filtro}`, { headers: authHeaders() });
+      if (res.status === 401) return sair();
       if (!res.ok) return;
       CHATS_CACHE = await res.json();
       renderizarListaChats();
